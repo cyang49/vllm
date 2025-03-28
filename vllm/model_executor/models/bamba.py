@@ -22,6 +22,8 @@ from vllm.model_executor.layers.mamba.mamba_mixer2 import (
     MambaMixer2, extra_groups_for_head_shards)
 from vllm.model_executor.layers.mamba.ops.ssd_chunk_scan import (
     seq_idx_to_chunk_indices_offsets)
+from vllm.model_executor.layers.mamba.ops.ssd_combined import (
+    mamba_chunk_scan_combined)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
@@ -81,7 +83,8 @@ class BambaMixerDecoderLayer(nn.Module):
                  layer_idx: int,
                  cache_config: Optional[CacheConfig] = None,
                  quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = "") -> None:
+                 prefix: str = "",
+                 compiled_mamba_ssd_combined=None) -> None:
         super().__init__()
         self.config = config
         self.mamba = MambaMixer2(hidden_size= config.hidden_size,
@@ -104,6 +107,7 @@ class BambaMixerDecoderLayer(nn.Module):
                                        eps=config.rms_norm_eps)
         self.pre_ff_layernorm = RMSNorm(config.hidden_size,
                                         eps=config.rms_norm_eps)
+        self.compiled_mamba_ssd_combined = compiled_mamba_ssd_combined
 
     def forward(
         self,
@@ -123,7 +127,8 @@ class BambaMixerDecoderLayer(nn.Module):
                 hidden_states, residual)
 
         hidden_states = self.mamba(hidden_states, mamba_cache_params,
-                                   sequence_idx, chunk_indices, chunk_offsets)
+                                   sequence_idx, chunk_indices, chunk_offsets,
+                                   self.compiled_mamba_ssd_combined)
         # Fully Connected
         hidden_states, residual = self.pre_ff_layernorm(
             hidden_states, residual)
@@ -280,17 +285,31 @@ class BambaModel(nn.Module):
             org_num_embeddings=config.vocab_size,
         )
 
+        # compiled_mamba_ssd_combined = None
+        compiled_mamba_ssd_combined = torch.compile(
+            mamba_chunk_scan_combined)  #, mode="reduce-overhead")
+
         def get_layer(prefix: str):
             layer_idx = int(prefix.rsplit(".", 1)[1])
             layer_class = ALL_DECODER_LAYER_TYPES[
                 config.layers_block_type[layer_idx]]
-            return layer_class(
-                config,
-                layer_idx,
-                cache_config,
-                quant_config=quant_config,
-                prefix=prefix,
-            )
+            if config.layers_block_type[layer_idx] == "mamba":
+                return layer_class(
+                    config,
+                    layer_idx,
+                    cache_config,
+                    quant_config=quant_config,
+                    prefix=prefix,
+                    compiled_mamba_ssd_combined=compiled_mamba_ssd_combined,
+                )
+            else:
+                return layer_class(
+                    config,
+                    layer_idx,
+                    cache_config,
+                    quant_config=quant_config,
+                    prefix=prefix,
+                )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers")

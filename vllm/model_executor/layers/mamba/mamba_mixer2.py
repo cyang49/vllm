@@ -391,6 +391,7 @@ class MambaMixer2(CustomOp):
         sequence_idx: Optional[torch.Tensor] = None,
         chunk_indices: Optional[torch.Tensor] = None,
         chunk_offsets: Optional[torch.Tensor] = None,
+        compiled_mamba_ssd_combined=None,
     ):
         # For the mamba2 triton kernels to operate in continuous batching,
         # the sequence_idx is needed to be passed in. Also, for the kernels
@@ -442,6 +443,9 @@ class MambaMixer2(CustomOp):
 
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "mamba_cache_params.state_indices_tensor"
+
+            # print(f"{hidden_states_B_C.transpose(0, 1).shape=}")
+            # print(f"{conv_weights.shape=}")
             hidden_states_B_C = causal_conv1d_fn(
                 hidden_states_B_C.transpose(0, 1),
                 conv_weights,
@@ -481,13 +485,17 @@ class MambaMixer2(CustomOp):
             initial_states = None
             if has_initial_states is not None and torch.any(
                     has_initial_states):
+                # print('chunked prefill:')
                 zero_init_indices = mamba_cache_params.state_indices_tensor[
                     ~has_initial_states]
                 mamba_cache_params.ssm_state[zero_init_indices] = 0
                 initial_states = mamba_cache_params.ssm_state[
                     mamba_cache_params.state_indices_tensor]
 
-            scan_output, varlen_state = mamba_chunk_scan_combined(
+            combined_fn = mamba_chunk_scan_combined if (
+                compiled_mamba_ssd_combined
+                is None) else compiled_mamba_ssd_combined
+            scan_output, varlen_state = combined_fn(
                 hidden_states.view(1, seq_len, self.num_heads // self.tp_size,
                                    self.head_dim),
                 dt.unsqueeze(0),
