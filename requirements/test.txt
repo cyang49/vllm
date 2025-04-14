@@ -25,12 +25,15 @@ anyio==4.6.2.post1
     #   starlette
 argcomplete==3.5.1
     # via datamodel-code-generator
+<<<<<<< HEAD
 arrow==1.3.0
     # via isoduration
 async-timeout==5.0.1
     # via
     #   aiohttp
     #   redis
+=======
+>>>>>>> 14cca7e99 (remove changed requirements by mistake/pre-hook?)
 attrs==24.2.0
     # via
     #   aiohttp
@@ -136,10 +139,6 @@ encodec==0.1.1
     # via vocos
 evaluate==0.4.3
     # via lm-eval
-exceptiongroup==1.2.2
-    # via
-    #   anyio
-    #   pytest
 fastparquet==2024.11.0
     # via genai-perf
 fastrlock==0.8.2
@@ -639,7 +638,10 @@ sentencepiece==0.2.0
     # via mistral-common
 setuptools==75.8.0
     # via
+<<<<<<< HEAD
     #   mamba-ssm
+=======
+>>>>>>> 14cca7e99 (remove changed requirements by mistake/pre-hook?)
     #   pytablewriter
     #   torch
 shellingham==1.5.4
@@ -775,16 +777,12 @@ types-python-dateutil==2.9.0.20241206
     # via arrow
 typing-extensions==4.12.2
     # via
-    #   anyio
-    #   black
     #   huggingface-hub
     #   librosa
     #   mistral-common
-    #   multidict
     #   pqdm
     #   pydantic
     #   pydantic-core
-    #   rich
     #   torch
     #   typer
 tzdata==2024.2
