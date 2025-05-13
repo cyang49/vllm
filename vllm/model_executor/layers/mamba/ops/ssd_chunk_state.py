@@ -15,13 +15,6 @@ from vllm.triton_utils.jit_cache import jitcache
 from .mamba_ssm import softplus
 
 
-@jitcache(
-    # check_keys should include constexpr args that may change across invocations
-    check_keys=["BLOCK_SIZE_H"],
-    # for variables that cannot be labeled constexpr because range > 32 bit
-    assume_const=[],
-    # cache_launch_grid=True,
-)
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_SIZE_H': 1}),
@@ -33,6 +26,13 @@ from .mamba_ssm import softplus
         triton.Config({'BLOCK_SIZE_H': 64}),
     ],
     key=['chunk_size', 'nheads'],
+)
+@jitcache(
+    # check_keys should include constexpr args that may change across invocations
+    check_keys=["BLOCK_SIZE_H"],
+    # for variables that cannot be labeled constexpr because range > 32 bit
+    assume_const=[],
+    # cache_launch_grid=True,
 )
 @triton.jit
 def _chunk_cumsum_fwd_kernel(
@@ -118,13 +118,6 @@ def _chunk_cumsum_fwd_kernel(
              mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size))
 
 
-@jitcache(
-    # check_keys should include constexpr args that may change across invocations
-    check_keys=["HAS_SEQ_IDX", "BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K"],
-    # for variables that cannot be labeled constexpr because range > 32 bit
-    assume_const=[],
-    # cache_launch_grid=True,
-)
 @triton.autotune(
     configs=[
         triton.Config(
@@ -201,6 +194,13 @@ def _chunk_cumsum_fwd_kernel(
             num_warps=2),
     ],
     key=['hdim', 'dstate', 'chunk_size'],
+)
+@jitcache(
+    # check_keys should include constexpr args that may change across invocations
+    check_keys=["HAS_SEQ_IDX", "BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K"],
+    # for variables that cannot be labeled constexpr because range > 32 bit
+    assume_const=[],
+    # cache_launch_grid=True,
 )
 @triton.jit
 def _chunk_state_fwd_kernel(
@@ -326,13 +326,6 @@ def _chunk_state_fwd_kernel(
     tl.store(states_ptrs, states, mask=c_mask)
 
 
-@jitcache(
-    # check_keys should include constexpr args that may change across invocations
-    check_keys=["HAS_INITSTATES", "HAS_SEQ_IDX", "BLOCK_SIZE"],
-    # for variables that cannot be labeled constexpr because range > 32 bit
-    assume_const=[],
-    # cache_launch_grid=True,
-)
 @triton.autotune(
     configs=[
         triton.Config(
@@ -409,6 +402,15 @@ def _chunk_state_fwd_kernel(
             num_warps=2),
     ],
     key=['hdim', 'dstate', 'chunk_size'],
+)
+@jitcache(
+    # check_keys should include constexpr args that may change across invocations
+    check_keys=[
+        "HAS_INITSTATES", "BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K"
+    ],
+    # for variables that cannot be labeled constexpr because range > 32 bit
+    assume_const=[],
+    # cache_launch_grid=True,
 )
 @triton.jit
 def _chunk_state_varlen_kernel(

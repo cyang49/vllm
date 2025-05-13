@@ -11,13 +11,6 @@ from vllm.triton_utils import tl, triton
 from vllm.triton_utils.jit_cache import jitcache
 
 
-@jitcache(
-    # check_keys should include constexpr args that may change across invocations
-    check_keys=["HAS_INITSTATES", "HAS_SEQ_IDX", "BLOCK_SIZE"],
-    # for variables that cannot be labeled constexpr because range > 32 bit
-    assume_const=[],
-    # cache_launch_grid=True,
-)
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_SIZE': 64}),
@@ -28,6 +21,13 @@ from vllm.triton_utils.jit_cache import jitcache
         triton.Config({'BLOCK_SIZE': 2048}),
     ],
     key=['dim'],
+)
+@jitcache(
+    # check_keys should include constexpr args that may change across invocations
+    check_keys=["HAS_INITSTATES", "HAS_SEQ_IDX", "BLOCK_SIZE"],
+    # for variables that cannot be labeled constexpr because range > 32 bit
+    assume_const=[],
+    # cache_launch_grid=True,
 )
 @triton.jit
 def _state_passing_fwd_kernel(

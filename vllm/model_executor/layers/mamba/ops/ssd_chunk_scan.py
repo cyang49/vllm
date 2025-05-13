@@ -14,15 +14,6 @@ from vllm.triton_utils.jit_cache import jitcache
 TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 
 
-@jitcache(
-    # check_keys should include constexpr args that may change across invocations
-    check_keys=[
-        "HAS_INITSTATES", "BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K"
-    ],
-    # for variables that cannot be labeled constexpr because range > 32 bit
-    assume_const=[],
-    # cache_launch_grid=True,
-)
 @triton.autotune(
     configs=[
         triton.Config(
@@ -115,6 +106,15 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
             num_warps=2),
     ],
     key=['chunk_size', 'hdim', 'dstate', 'IS_CAUSAL'],
+)
+@jitcache(
+    # check_keys should include constexpr args that may change across invocations
+    check_keys=[
+        "HAS_INITSTATES", "BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K"
+    ],
+    # for variables that cannot be labeled constexpr because range > 32 bit
+    assume_const=[],
+    # cache_launch_grid=True,
 )
 @triton.jit
 def _chunk_scan_fwd_kernel(
