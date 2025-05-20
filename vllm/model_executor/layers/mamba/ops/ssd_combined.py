@@ -8,16 +8,93 @@
 import torch
 from einops import rearrange
 from packaging import version
+from torch import nn
 
 from vllm.triton_utils import triton
 
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
-from .ssd_chunk_state import (_chunk_cumsum_fwd, _chunk_state_fwd,
-                              chunk_state_varlen)
+from .ssd_chunk_state import _chunk_state_fwd, chunk_state_varlen
 from .ssd_state_passing import _state_passing_fwd
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
+
+
+# Helper methods for segment sum computation
+# Copied from huggingface transformers
+# https://github.com/huggingface/transformers/blob/main/src/transformers/models/mamba2/modeling_mamba2.py
+def pad_tensor_by_size(input_tensor: torch.Tensor, pad_size: int):
+    """
+    Padding x tensor with `pad_size` on the seq_len dim (dim=1)
+
+    Assumes that we only have tensors of either size 4 or 3
+    """
+    pad_shape = (0, 0, 0, 0, 0, pad_size, 0,
+                 0) if len(input_tensor.shape) == 4 else (0, 0, 0, pad_size, 0,
+                                                          0)
+
+    return torch.nn.functional.pad(input_tensor,
+                                   pad_shape,
+                                   mode="constant",
+                                   value=0)
+
+
+def reshape_into_chunks(input_tensor, pad_size, chunk_size):
+    """
+    Padding input_tensor with `pad_size` on the seq_len dim (dim=1) and
+    simultaneously splitting it into chunk sequences.
+
+    Assumes that we only have tensors of either size 4 or 3
+    """
+    # [bsz, seq_len, ...] -> [bsz, seq_len multiple of chunk_size, ...]
+    input_tensor = pad_tensor_by_size(input_tensor, pad_size)
+
+    if len(input_tensor.shape) == 3:
+        # [bsz, seq_len multiple of chunk_size, num_heads] -> [bsz, -1, chunk_size, num_heads]
+        return input_tensor.reshape(input_tensor.shape[0], -1, chunk_size,
+                                    input_tensor.shape[2])
+    else:
+        # [bsz, seq_len multiple of chunk_size, num_heads, head_dim or state_size] -> [bsz, -1, chunk_size, num_heads, head_dim or state_size]
+        return input_tensor.reshape(input_tensor.shape[0], -1, chunk_size,
+                                    input_tensor.shape[2],
+                                    input_tensor.shape[3])
+
+
+USE_COMPILED_FN = True
+
+
+def torch_chunk_cumsum_fwd(
+    dt,  # (batch, seqlen, nheads)
+    A,  # (nheads, )
+    chunk_size: int,
+    dt_bias=None,
+    dt_softplus: bool = False,
+    dt_limit=(0.0, float('inf'))):
+    seqlen = dt.shape[1]
+    pad_size = (chunk_size - seqlen % chunk_size) % chunk_size
+
+    if dt_bias is not None:
+        dt += dt_bias
+    if dt_softplus:
+        dt = nn.functional.softplus(dt)
+    dt = torch.clamp(dt, *(dt_limit))
+
+    # Discretize and reshape A
+    dA = reshape_into_chunks(A.to(dt.dtype) * dt, pad_size, chunk_size)
+    dt = reshape_into_chunks(dt, pad_size, chunk_size)
+
+    # [bsz, -1, chunk_size, num_heads] -> [bsz, num_heads, -1, chunk_size]
+    dt = dt.permute(0, 3, 1, 2)
+    dA = dA.permute(0, 3, 1, 2)
+
+    # Cumsum within chunks
+    dA_cumsum = torch.cumsum(dA, dim=-1)
+
+    return dA_cumsum, dt
+
+
+compiled_cumsum_fwd = None if not USE_COMPILED_FN else torch.compile(
+    torch_chunk_cumsum_fwd, fullgraph=True)
 
 
 def _mamba_chunk_scan_combined_fwd(x,
@@ -79,12 +156,23 @@ def _mamba_chunk_scan_combined_fwd(x,
 
     # 1. Compute chunked cumsum of A * dt
     # - here dt may go through a softplus activation
-    dA_cumsum, dt = _chunk_cumsum_fwd(dt,
-                                      A,
-                                      chunk_size,
-                                      dt_bias=dt_bias,
-                                      dt_softplus=dt_softplus,
-                                      dt_limit=dt_limit)
+    global compiled_cumsum_fwd
+    if USE_COMPILED_FN:
+        dA_cumsum, dt = compiled_cumsum_fwd(dt,
+                                            A,
+                                            chunk_size,
+                                            dt_bias=dt_bias,
+                                            dt_softplus=dt_softplus,
+                                            dt_limit=dt_limit)
+    else:
+        dA_cumsum, dt = torch_chunk_cumsum_fwd(dt,
+                                               A,
+                                               chunk_size,
+                                               dt_bias=dt_bias,
+                                               dt_softplus=dt_softplus,
+                                               dt_limit=dt_limit)
+        # print(f"{dt.shape=}")
+        # print(f"{dA_cumsum.shape=}")
 
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
