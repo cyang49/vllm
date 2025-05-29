@@ -14,13 +14,17 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
+from vllm.model_executor.layers.mamba.fused_ops import (block_cumsum,
+                                                        block_scan,
+                                                        fused_block_scan,
+                                                        fused_block_ssd_intra,
+                                                        fused_block_state_bmm,
+                                                        state_passing)
 from vllm.model_executor.layers.mamba.mamba2_metadata import Mamba2Metadata
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn, causal_conv1d_update)
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
     selective_state_update)
-from vllm.model_executor.layers.mamba.ops.ssd_combined import (
-    mamba_chunk_scan_combined)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
     LoaderFunction, composed_weight_loader, sharded_weight_loader)
@@ -28,6 +32,29 @@ from vllm.model_executor.models.mamba_cache import MambaCacheParams
 from vllm.model_executor.utils import set_weight_attrs
 
 # Added by the IBM Team, 2024
+
+
+# debug helper function
+# assume the input tensor is 2D and has shape (seqlen, hidden_dim)
+def varlen_batch_to_padded_blocks(input_tensor,
+                                  block_cu_seqlens,
+                                  block_size,
+                                  pad_value=0.0,
+                                  repeat_last=False):
+    nblocks = len(block_cu_seqlens) - 1
+    hidden_dim = input_tensor.size(-1)
+    output_tensor = torch.full((nblocks, block_size, hidden_dim),
+                               fill_value=pad_value,
+                               dtype=input_tensor.dtype,
+                               device=input_tensor.device)
+    for i in range(nblocks):
+        bstart, bend = block_cu_seqlens[i], block_cu_seqlens[i + 1]
+        ntokens = bend - bstart
+        output_tensor[i, :ntokens] = input_tensor[bstart:bend]
+        if repeat_last and ntokens != block_size:
+            output_tensor[i, ntokens:] = output_tensor[i, ntokens - 1]
+
+    return output_tensor
 
 
 # Adapted from transformers.models.mamba2.modeling_mamba2.MambaRMSNormGated
@@ -522,34 +549,180 @@ class MambaMixer2(CustomOp):
                     mamba2_metadata.has_initial_states[:, None, None, None],
                     mamba_cache_params.ssm_state[state_indices_tensor_p], 0)
 
-            scan_output, varlen_state = mamba_chunk_scan_combined(
-                hidden_states_p.view(1, num_prefill_tokens,
-                                     self.num_heads // self.tp_size,
-                                     self.head_dim),
-                dt_p.unsqueeze(0),
-                self.A,
-                B_p.view(1, num_prefill_tokens, self.n_groups // self.tp_size,
-                         -1),
-                C_p.view(1, num_prefill_tokens, self.n_groups // self.tp_size,
-                         -1),
-                chunk_size=mamba2_metadata.chunk_size,
-                D=self.D,
-                z=None,
-                dt_bias=self.dt_bias,
-                seq_idx=mamba2_metadata.seq_idx,
-                chunk_indices=mamba2_metadata.chunk_indices,
-                chunk_offsets=mamba2_metadata.chunk_offsets,
-                cu_seqlens=attn_metadata.query_start_loc[:num_prefills + 1],
-                initial_states=initial_states,
-                return_varlen_states=True,
-                return_final_states=False,
-                dt_softplus=True,
-                dt_limit=(0.0, float("inf")),
-            )
+            # Padded blocks implementation
+            # reshaping 2d (seqlen, hdim) to 3d (nblocks, block_size, hdim)
+            # nblocks = len(mamba2_metadata.block_cu_seqlens) - 1
+            block_size = mamba2_metadata.chunk_size
+            batch = len(mamba2_metadata.req_cu_nblocks) - 1
+            assert batch == num_prefills
+            x_p = hidden_states_p.view(num_prefill_tokens,
+                                       self.num_heads // self.tp_size,
+                                       self.head_dim)
+            B_p = B_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
+                           -1)
+            C_p = C_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
+                           -1)
+
+            num_fused = 4
+            if num_fused == 2:  # 2 kernel control flow
+                align_blocks = True
+                dA_cumsum, dt_out, block_states, CB = fused_block_ssd_intra(
+                    x=x_p,
+                    dt=dt_p,
+                    A=self.A,
+                    B=B_p,
+                    C=C_p,
+                    block_size=block_size,
+                    block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                    dt_bias=self.dt_bias,
+                    dt_softplus=True,
+                    states_in_fp32=True,
+                    FUSED_COMPUTE_CB=True,
+                    align_blocks=align_blocks,
+                    block_packed_cu_seqlens=mamba2_metadata.
+                    block_packed_cu_seqlens,
+                    packed_seqlen=mamba2_metadata.packed_seqlen,
+                )
+
+                # final_states, prev_states = state_passing(
+                #     dA_cumsum=dA_cumsum,
+                #     block_states=block_states,
+                #     initial_states=initial_states,
+                #     block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                #     block_req_idx=mamba2_metadata.block_req_idx,
+                #     req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
+                #     return_prev_states=True,
+                #     out_dtype=C_p.dtype,
+                #     align_blocks=align_blocks,
+                #     block_packed_cu_seqlens=mamba2_metadata.
+                #     block_packed_cu_seqlens,
+                # )
+
+                # # Fused state passing - Confirmed working
+                # _, scan_output, _ = fused_block_scan(
+                #     x=x_p,
+                #     dt=dt_out,
+                #     dA_cumsum=dA_cumsum,
+                #     block_states=prev_states,
+                #     initial_states=initial_states,
+                #     C=C_p,
+                #     D=self.D,
+                #     CB=CB,
+                #     block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                #     block_req_idx=mamba2_metadata.block_req_idx,
+                #     req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
+                #     return_prev_states=False,
+                #     fused_state_passing=False,
+                #     align_blocks=align_blocks,
+                #     out_dtype=C_p.dtype,
+                #     block_packed_cu_seqlens=mamba2_metadata.
+                #     block_packed_cu_seqlens,
+                # )
+
+                # Fused state passing - Confirmed working
+                final_states, scan_output, _ = fused_block_scan(
+                    x=x_p,
+                    dt=dt_out,
+                    dA_cumsum=dA_cumsum,
+                    block_states=block_states,
+                    initial_states=initial_states,
+                    C=C_p,
+                    D=self.D,
+                    CB=CB,
+                    block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                    block_req_idx=mamba2_metadata.block_req_idx,
+                    req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
+                    return_prev_states=False,
+                    fused_state_passing=True,
+                    align_blocks=align_blocks,
+                    out_dtype=C_p.dtype,
+                    block_packed_cu_seqlens=mamba2_metadata.
+                    block_packed_cu_seqlens,
+                )
+
+            else:
+                align_blocks = True
+                if num_fused == 3:
+                    dA_cumsum, dt_out, block_states, CB = fused_block_ssd_intra(
+                        x=x_p,
+                        dt=dt_p,
+                        A=self.A,
+                        B=B_p,
+                        C=C_p,
+                        block_size=block_size,
+                        block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                        dt_bias=self.dt_bias,
+                        dt_softplus=True,
+                        states_in_fp32=True,
+                        FUSED_COMPUTE_CB=True,
+                        align_blocks=align_blocks,
+                        block_packed_cu_seqlens=mamba2_metadata.
+                        block_packed_cu_seqlens,
+                        packed_seqlen=mamba2_metadata.packed_seqlen,
+                    )
+                else:  # 4 kernels
+                    dA_cumsum, dt_out = block_cumsum(
+                        dt=dt_p,
+                        A=self.A,
+                        block_size=block_size,
+                        block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                        dt_bias=self.dt_bias,
+                        dt_softplus=True,
+                        align_blocks=align_blocks,
+                        block_packed_cu_seqlens=mamba2_metadata.
+                        block_packed_cu_seqlens,
+                        packed_seqlen=mamba2_metadata.packed_seqlen,
+                    )
+
+                    block_states, CB = fused_block_state_bmm(
+                        x=x_p,
+                        dt=dt_out,
+                        dA_cumsum=dA_cumsum,
+                        B=B_p,
+                        C=C_p,
+                        block_size=block_size,
+                        block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                        states_in_fp32=True,
+                        FUSED_COMPUTE_CB=True,
+                        align_blocks=align_blocks,
+                        block_packed_cu_seqlens=mamba2_metadata.
+                        block_packed_cu_seqlens,
+                    )
+
+                final_states, prev_states = state_passing(
+                    dA_cumsum=dA_cumsum,
+                    block_states=block_states,
+                    initial_states=initial_states,
+                    block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                    block_req_idx=mamba2_metadata.block_req_idx,
+                    req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
+                    return_prev_states=True,
+                    out_dtype=C_p.dtype,
+                    align_blocks=align_blocks,
+                    block_packed_cu_seqlens=mamba2_metadata.
+                    block_packed_cu_seqlens,
+                )
+
+                scan_output = block_scan(
+                    x=x_p,
+                    dt=dt_out,
+                    dA_cumsum=dA_cumsum,
+                    prev_states=prev_states,
+                    C=C_p,
+                    D=self.D,
+                    CB=CB,
+                    block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                    align_blocks=align_blocks,
+                    block_packed_cu_seqlens=mamba2_metadata.
+                    block_packed_cu_seqlens,
+                )
+
+            varlen_states = final_states.to(torch.float16)
 
             # update ssm states
             # - varlen state is a (num_prefills, nheads, headdim, dstate) tensor
-            mamba_cache_params.ssm_state[state_indices_tensor_p] = varlen_state
+            mamba_cache_params.ssm_state[
+                state_indices_tensor_p] = varlen_states
 
             # - reshape
             ssd_output_list.append(scan_output.view(num_prefill_tokens, -1))

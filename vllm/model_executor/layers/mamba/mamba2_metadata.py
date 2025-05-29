@@ -21,6 +21,14 @@ class Mamba2Metadata:
     chunk_indices: torch.Tensor
     chunk_offsets: torch.Tensor
 
+    req_cu_nblocks: torch.Tensor
+    block_cu_seqlens: torch.Tensor
+    block_req_idx: torch.Tensor
+    block_ntokens: torch.Tensor
+
+    block_packed_cu_seqlens: torch.Tensor
+    packed_seqlen: int
+
 
 def get_platform_metadata_classes() -> tuple[type[AttentionMetadata], ...]:
     """Returns the appropriate metadata classes for the current platform."""
@@ -73,6 +81,63 @@ def _query_start_loc_to_chunk_indices_offsets(query_start_loc: torch.Tensor,
     return chunk_indices, chunk_offsets
 
 
+def _get_block_ranges(query_start_loc: torch.Tensor,
+                      block_size: int,
+                      sum_seqlens: int,
+                      pack_size: int = 4):
+    device = query_start_loc.device
+    seqlens = torch.diff(query_start_loc)
+    nreqs = len(seqlens)
+
+    # request level metadata
+    req_full_blocks = seqlens // block_size  # num of full blocks per request
+    req_full_lens = torch.full(
+        [nreqs], block_size,
+        device=device)  # num of tokens in full blocks of requests
+    req_rem_lens = seqlens % block_size  # num of tokens in remainder blocks
+    req_nblocks = req_full_blocks + (req_rem_lens > 0
+                                     )  # num of blocks per request
+
+    # block level metadata
+    nblocks = req_nblocks.sum()
+
+    block_ntokens = torch.repeat_interleave(
+        torch.stack((req_full_lens, req_rem_lens), dim=1).view(-1),
+        torch.stack((req_full_blocks, (req_rem_lens > 0)), dim=1).view(-1),
+        output_size=nblocks,
+    )
+
+    # block to request index mapping
+    block_req_idx = torch.repeat_interleave(
+        torch.arange(nreqs, device=device),
+        req_nblocks,
+        output_size=nblocks,
+    )
+
+    block_cu_seqlens = torch.cat([
+        torch.zeros([1], dtype=torch.int32, device=device),
+        torch.cumsum(block_ntokens, dim=0),
+    ])
+
+    # metadata for packed fp32 vectorization
+    block_packed_fill = (pack_size - block_ntokens % pack_size) % pack_size
+    block_packed_cu_seqlens = torch.cat([
+        torch.zeros([1], dtype=torch.int32, device=device),
+        torch.cumsum(block_packed_fill, dim=0),
+    ]) + block_cu_seqlens
+
+    # request level metadata
+    req_cu_nblocks = torch.cat([
+        torch.zeros([1], dtype=torch.int32, device=device),
+        torch.cumsum(req_nblocks, dim=0),
+    ])
+    # sanity check
+    assert block_cu_seqlens[-1] == sum_seqlens
+
+    return (req_cu_nblocks, block_cu_seqlens, block_req_idx, block_ntokens,
+            block_packed_cu_seqlens)
+
+
 def prepare_mamba2_metadata(
     chunk_size: int,
     attn_metadata: AttentionMetadata,
@@ -85,6 +150,9 @@ def prepare_mamba2_metadata(
 
     seq_idx = None
     chunk_indices, chunk_offsets = None, None
+    req_cu_nblocks, block_cu_seqlens, block_req_idx, block_ntokens = \
+        None, None, None, None
+    block_packed_cu_seqlens = None
     # Need flags to indicate if there are initial states
     # currently we really only support the FlashAttention backend
     has_initial_states = None
@@ -99,7 +167,8 @@ def prepare_mamba2_metadata(
                 attn_metadata.context_lens_tensor[:num_prefills] > 0  #[batch,]
             # precompute flag to avoid device syncs in mamba2 layer forwards
             # prep is only needed for mamba2 ssd prefill processing
-            prep_initial_states = torch.any(has_initial_states).item()
+            # prep_initial_states = torch.any(has_initial_states).item()
+            prep_initial_states = True  # Force prep initial states for now
 
         query_start_loc = attn_metadata.query_start_loc[:num_prefills + 1]
         seq_idx = torch.repeat_interleave(torch.arange(
@@ -116,9 +185,20 @@ def prepare_mamba2_metadata(
                 _query_start_loc_to_chunk_indices_offsets(
                 query_start_loc, chunk_size, num_prefill_tokens)
 
+        req_cu_nblocks, block_cu_seqlens, block_req_idx, \
+            block_ntokens, block_packed_cu_seqlens = \
+            _get_block_ranges(query_start_loc, chunk_size, num_prefill_tokens)
+
     return Mamba2Metadata(has_initial_states=has_initial_states,
                           prep_initial_states=prep_initial_states,
                           chunk_size=chunk_size,
                           seq_idx=seq_idx,
                           chunk_indices=chunk_indices,
-                          chunk_offsets=chunk_offsets)
+                          chunk_offsets=chunk_offsets,
+                          req_cu_nblocks=req_cu_nblocks,
+                          block_cu_seqlens=block_cu_seqlens,
+                          block_req_idx=block_req_idx,
+                          block_ntokens=block_ntokens,
+                          block_packed_cu_seqlens=block_packed_cu_seqlens,
+                          packed_seqlen=block_packed_cu_seqlens[-1].item()
+                          if block_packed_cu_seqlens is not None else -1)
