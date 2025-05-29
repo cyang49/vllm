@@ -38,6 +38,7 @@ def _mamba_chunk_scan_combined_fwd(x,
                                    dt_limit=(0.0, float("inf"))):
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
+
     assert nheads % ngroups == 0
     assert B.shape == (batch, seqlen, ngroups, dstate)
     assert dt.shape == (batch, seqlen, nheads)
@@ -62,11 +63,21 @@ def _mamba_chunk_scan_combined_fwd(x,
     if D is not None and D.stride(-1) != 1:
         D = D.contiguous()
     if initial_states is not None:
-        if cu_seqlens is None:
-            assert initial_states.shape == (batch, nheads, headdim, dstate)
-        else:
-            assert initial_states.shape == (len(cu_seqlens) - 1, nheads,
-                                            headdim, dstate)
+        # if cu_seqlens is None:
+        #     assert initial_states.shape == (batch, nheads, headdim, dstate)
+        # else:
+        assert cu_seqlens is not None
+        assert initial_states.shape == (len(cu_seqlens) - 1, nheads, headdim,
+                                        dstate)
+
+    assert batch == 1  # assume varlen batch inputs
+    # Getting rid of the batch dimension to simplify kernels
+    # x.squeeze_(0)
+    # dt.squeeze_(0)
+    # B.squeeze_(0)
+    # C.squeeze_(0)
+    # assert D is None
+    # assert z is None
 
     # This function executes 5 sub-functions for computing mamba
     # - a good resource is the blog https://goombalab.github.io/blog/2024/mamba2-part3-algorithm/
@@ -79,7 +90,7 @@ def _mamba_chunk_scan_combined_fwd(x,
 
     # 1. Compute chunked cumsum of A * dt
     # - here dt may go through a softplus activation
-    dA_cumsum, dt = _chunk_cumsum_fwd(dt,
+    dA_cumsum, dt = _chunk_cumsum_fwd(dt.squeeze(0),
                                       A,
                                       chunk_size,
                                       dt_bias=dt_bias,
@@ -88,13 +99,15 @@ def _mamba_chunk_scan_combined_fwd(x,
 
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
-    states = _chunk_state_fwd(B,
-                              x,
+    states = _chunk_state_fwd(B.squeeze(0),
+                              x.squeeze(0),
                               dt,
                               dA_cumsum,
-                              seq_idx=seq_idx,
+                              seq_idx=seq_idx.squeeze(0),
                               states_in_fp32=True)
-
+    states.unsqueeze_(0)
+    dA_cumsum.unsqueeze_(0)
+    dt.unsqueeze_(0)
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
     # - for handling chunked prefill, this requires i) initial_states
