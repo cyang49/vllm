@@ -62,11 +62,11 @@ def _mamba_chunk_scan_combined_fwd(x,
         z = z.contiguous()
     if D is not None and D.stride(-1) != 1:
         D = D.contiguous()
+    assert cu_seqlens is not None
     if initial_states is not None:
         # if cu_seqlens is None:
         #     assert initial_states.shape == (batch, nheads, headdim, dstate)
         # else:
-        assert cu_seqlens is not None
         assert initial_states.shape == (len(cu_seqlens) - 1, nheads, headdim,
                                         dstate)
 
@@ -105,9 +105,9 @@ def _mamba_chunk_scan_combined_fwd(x,
                               dA_cumsum,
                               seq_idx=seq_idx.squeeze(0),
                               states_in_fp32=True)
-    states.unsqueeze_(0)
-    dA_cumsum.unsqueeze_(0)
-    dt.unsqueeze_(0)
+    # states.unsqueeze_(0)
+    # dA_cumsum.unsqueeze_(0)
+    # dt.unsqueeze_(0)
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
     # - for handling chunked prefill, this requires i) initial_states
@@ -117,17 +117,33 @@ def _mamba_chunk_scan_combined_fwd(x,
     # - this will ensure that states will be updated with the rightmost flushed seq_idx
     #   of the previous chunk. This implies that the first chunk of states is either 0
     #   or equal to init_states of the first example.
-    states, final_states = _state_passing_fwd(
+    # states, final_states = _state_passing_fwd(
+    #     rearrange(states, "... p n -> ... (p n)"),
+    #     dA_cumsum[:, :, :, -1],
+    #     initial_states=rearrange(initial_states, "... p n -> ... (p n)")
+    #     if initial_states is not None else None,
+    #     seq_idx=seq_idx,
+    #     chunk_size=chunk_size,
+    #     out_dtype=C.dtype,
+    #     is_cont_batched=cu_seqlens is not None)
+    # states, final_states = (rearrange(t, "... (p n) -> ... p n", n=dstate)
+    #                         for t in [states, final_states])
+    # print(f"{seq_idx=}")
+    # print(f"{seq_idx.shape=}")
+    states = _state_passing_fwd(
         rearrange(states, "... p n -> ... (p n)"),
-        dA_cumsum[:, :, :, -1],
+        dA_cumsum[:, :, -1],
         initial_states=rearrange(initial_states, "... p n -> ... (p n)")
         if initial_states is not None else None,
-        seq_idx=seq_idx,
+        seq_idx=seq_idx.squeeze(0),
         chunk_size=chunk_size,
         out_dtype=C.dtype,
         is_cont_batched=cu_seqlens is not None)
-    states, final_states = (rearrange(t, "... (p n) -> ... p n", n=dstate)
-                            for t in [states, final_states])
+    states = rearrange(states, "... (p n) -> ... p n", n=dstate)
+
+    states.unsqueeze_(0)
+    dA_cumsum.unsqueeze_(0)
+    dt.unsqueeze_(0)
 
     # 4. Compute batched matrix multiply for C_j^T B_i terms
     CB = _bmm_chunk_fwd(C,
@@ -160,20 +176,21 @@ def _mamba_chunk_scan_combined_fwd(x,
         chunk_offsets=chunk_offsets,
         initial_states=initial_states,
     )
-    if cu_seqlens is None:
-        return out, out_x, dt, dA_cumsum, states, final_states
-    else:
-        assert batch == 1, "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
-        varlen_states = chunk_state_varlen(
-            B.squeeze(0),
-            x.squeeze(0),
-            dt.squeeze(0),
-            dA_cumsum.squeeze(0),
-            cu_seqlens,
-            states.squeeze(0),
-            initial_states=initial_states,
-        )
-        return out, out_x, dt, dA_cumsum, states, final_states, varlen_states
+    # if cu_seqlens is None:
+    #     return out, out_x, dt, dA_cumsum, states, final_states
+    # else:
+    assert cu_seqlens is not None
+    assert batch == 1, "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
+    varlen_states = chunk_state_varlen(
+        B.squeeze(0),
+        x.squeeze(0),
+        dt.squeeze(0),
+        dA_cumsum.squeeze(0),
+        cu_seqlens,
+        states.squeeze(0),
+        initial_states=initial_states,
+    )
+    return out, out_x, dt, dA_cumsum, states, None, varlen_states
 
 
 def mamba_chunk_scan_combined(x,
