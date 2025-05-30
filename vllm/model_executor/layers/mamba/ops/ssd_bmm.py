@@ -159,7 +159,6 @@ def _bmm_chunk_fwd_kernel(
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
     seq_idx_m = tl.load(seq_idx_ptr + offs_m * stride_seq_idx_seqlen,
                         mask=offs_m < chunk_size_limit,
                         other=-1)

@@ -62,22 +62,18 @@ def _mamba_chunk_scan_combined_fwd(x,
         z = z.contiguous()
     if D is not None and D.stride(-1) != 1:
         D = D.contiguous()
-    assert cu_seqlens is not None
+    assert cu_seqlens is not None, "Assuming varlen input - must supply cu_seqlens"
+    assert batch == 1, "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
     if initial_states is not None:
-        # if cu_seqlens is None:
-        #     assert initial_states.shape == (batch, nheads, headdim, dstate)
-        # else:
         assert initial_states.shape == (len(cu_seqlens) - 1, nheads, headdim,
                                         dstate)
 
-    assert batch == 1  # assume varlen batch inputs
     # Getting rid of the batch dimension to simplify kernels
-    # x.squeeze_(0)
-    # dt.squeeze_(0)
-    # B.squeeze_(0)
-    # C.squeeze_(0)
-    # assert D is None
-    # assert z is None
+    x.squeeze_(0)
+    dt.squeeze_(0)
+    B.squeeze_(0)
+    C.squeeze_(0)
+    seq_idx = seq_idx.squeeze(0)
 
     # This function executes 5 sub-functions for computing mamba
     # - a good resource is the blog https://goombalab.github.io/blog/2024/mamba2-part3-algorithm/
@@ -90,7 +86,7 @@ def _mamba_chunk_scan_combined_fwd(x,
 
     # 1. Compute chunked cumsum of A * dt
     # - here dt may go through a softplus activation
-    dA_cumsum, dt = _chunk_cumsum_fwd(dt.squeeze(0),
+    dA_cumsum, dt = _chunk_cumsum_fwd(dt,
                                       A,
                                       chunk_size,
                                       dt_bias=dt_bias,
@@ -99,15 +95,13 @@ def _mamba_chunk_scan_combined_fwd(x,
 
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
-    states = _chunk_state_fwd(B.squeeze(0),
-                              x.squeeze(0),
+    states = _chunk_state_fwd(B,
+                              x,
                               dt,
                               dA_cumsum,
-                              seq_idx=seq_idx.squeeze(0),
+                              seq_idx=seq_idx,
                               states_in_fp32=True)
-    # states.unsqueeze_(0)
-    # dA_cumsum.unsqueeze_(0)
-    # dt.unsqueeze_(0)
+
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
     # - for handling chunked prefill, this requires i) initial_states
@@ -117,41 +111,23 @@ def _mamba_chunk_scan_combined_fwd(x,
     # - this will ensure that states will be updated with the rightmost flushed seq_idx
     #   of the previous chunk. This implies that the first chunk of states is either 0
     #   or equal to init_states of the first example.
-    # states, final_states = _state_passing_fwd(
-    #     rearrange(states, "... p n -> ... (p n)"),
-    #     dA_cumsum[:, :, :, -1],
-    #     initial_states=rearrange(initial_states, "... p n -> ... (p n)")
-    #     if initial_states is not None else None,
-    #     seq_idx=seq_idx,
-    #     chunk_size=chunk_size,
-    #     out_dtype=C.dtype,
-    #     is_cont_batched=cu_seqlens is not None)
-    # states, final_states = (rearrange(t, "... (p n) -> ... p n", n=dstate)
-    #                         for t in [states, final_states])
-    # print(f"{seq_idx=}")
-    # print(f"{seq_idx.shape=}")
     states = _state_passing_fwd(
         rearrange(states, "... p n -> ... (p n)"),
         dA_cumsum[:, :, -1],
         initial_states=rearrange(initial_states, "... p n -> ... (p n)")
         if initial_states is not None else None,
-        seq_idx=seq_idx.squeeze(0),
+        seq_idx=seq_idx,
         chunk_size=chunk_size,
         out_dtype=C.dtype,
         is_cont_batched=cu_seqlens is not None)
     states = rearrange(states, "... (p n) -> ... p n", n=dstate)
 
     # 4. Compute batched matrix multiply for C_j^T B_i terms
-    CB = _bmm_chunk_fwd(C.squeeze(0),
-                        B.squeeze(0),
+    CB = _bmm_chunk_fwd(C,
+                        B,
                         chunk_size,
-                        seq_idx=seq_idx.squeeze(0),
+                        seq_idx=seq_idx,
                         output_dtype=torch.float32)
-
-    states.unsqueeze_(0)
-    dA_cumsum.unsqueeze_(0)
-    dt.unsqueeze_(0)
-    CB.unsqueeze_(0)
 
     # 5. Scan and compute the diagonal blocks, taking into
     #    account past causal states.
@@ -177,18 +153,14 @@ def _mamba_chunk_scan_combined_fwd(x,
         chunk_offsets=chunk_offsets,
         initial_states=initial_states,
     )
-    # if cu_seqlens is None:
-    #     return out, out_x, dt, dA_cumsum, states, final_states
-    # else:
-    assert cu_seqlens is not None
-    assert batch == 1, "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
+
     varlen_states = chunk_state_varlen(
-        B.squeeze(0),
-        x.squeeze(0),
-        dt.squeeze(0),
-        dA_cumsum.squeeze(0),
+        B,
+        x,
+        dt,
+        dA_cumsum,
         cu_seqlens,
-        states.squeeze(0),
+        states,
         initial_states=initial_states,
     )
     return out, out_x, dt, dA_cumsum, states, None, varlen_states
