@@ -141,16 +141,17 @@ def _mamba_chunk_scan_combined_fwd(x,
         is_cont_batched=cu_seqlens is not None)
     states = rearrange(states, "... (p n) -> ... p n", n=dstate)
 
+    # 4. Compute batched matrix multiply for C_j^T B_i terms
+    CB = _bmm_chunk_fwd(C.squeeze(0),
+                        B.squeeze(0),
+                        chunk_size,
+                        seq_idx=seq_idx.squeeze(0),
+                        output_dtype=torch.float32)
+
     states.unsqueeze_(0)
     dA_cumsum.unsqueeze_(0)
     dt.unsqueeze_(0)
-
-    # 4. Compute batched matrix multiply for C_j^T B_i terms
-    CB = _bmm_chunk_fwd(C,
-                        B,
-                        chunk_size,
-                        seq_idx=seq_idx,
-                        output_dtype=torch.float32)
+    CB.unsqueeze_(0)
 
     # 5. Scan and compute the diagonal blocks, taking into
     #    account past causal states.
