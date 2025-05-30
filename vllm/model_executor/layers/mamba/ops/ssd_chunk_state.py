@@ -214,7 +214,6 @@ def _chunk_state_fwd_kernel(
     stride_dA_cs_csize: tl.constexpr,
     stride_seq_idx_seqlen: tl.constexpr,
     # Meta-parameters
-    HAS_SEQ_IDX: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -229,8 +228,8 @@ def _chunk_state_fwd_kernel(
     x_ptr += pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
     dt_ptr += pid_c * stride_dt_chunk + pid_h * stride_dt_head
     dA_cumsum_ptr += pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
-    if HAS_SEQ_IDX:
-        seq_idx_ptr += pid_c * chunk_size * stride_seq_idx_seqlen
+
+    seq_idx_ptr += pid_c * chunk_size * stride_seq_idx_seqlen
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -243,13 +242,11 @@ def _chunk_state_fwd_kernel(
     dA_cs_last = tl.load(dA_cumsum_ptr +
                          (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
     dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
-    if HAS_SEQ_IDX:
-        seq_idx_ptrs = seq_idx_ptr + offs_k * stride_seq_idx_seqlen
 
+    seq_idx_ptrs = seq_idx_ptr + offs_k * stride_seq_idx_seqlen
     chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
-    if HAS_SEQ_IDX:
-        seq_idx_last = tl.load(seq_idx_ptr +
-                               (chunk_size_limit - 1) * stride_seq_idx_seqlen)
+    seq_idx_last = tl.load(seq_idx_ptr +
+                           (chunk_size_limit - 1) * stride_seq_idx_seqlen)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, chunk_size_limit, BLOCK_SIZE_K):
@@ -264,26 +261,25 @@ def _chunk_state_fwd_kernel(
         dA_cs_k = tl.load(dA_cumsum_ptrs,
                           mask=offs_k < chunk_size_limit - k,
                           other=0.0).to(tl.float32)
-        if HAS_SEQ_IDX:
-            seq_idx_k = tl.load(seq_idx_ptrs,
-                                mask=offs_k < chunk_size_limit - k,
-                                other=-1)
+
+        seq_idx_k = tl.load(seq_idx_ptrs,
+                            mask=offs_k < chunk_size_limit - k,
+                            other=-1)
         dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size_limit - k,
                        other=0.0).to(tl.float32)
-        if not HAS_SEQ_IDX:
-            scale = tl.exp(dA_cs_last - dA_cs_k) * dt_k
-        else:
-            scale = tl.where(seq_idx_k == seq_idx_last,
-                             tl.exp(dA_cs_last - dA_cs_k) * dt_k, 0.0)
+
+        scale = tl.where(seq_idx_k == seq_idx_last,
+                         tl.exp(dA_cs_last - dA_cs_k) * dt_k, 0.0)
         b *= scale[:, None]
         b = b.to(x_ptr.dtype.element_ty)
         acc += tl.dot(x, b)
+
         x_ptrs += BLOCK_SIZE_K * stride_x_seqlen
         b_ptrs += BLOCK_SIZE_K * stride_b_seqlen
         dt_ptrs += BLOCK_SIZE_K * stride_dt_csize
         dA_cumsum_ptrs += BLOCK_SIZE_K * stride_dA_cs_csize
-        if HAS_SEQ_IDX:
-            seq_idx_ptrs += BLOCK_SIZE_K * stride_seq_idx_seqlen
+        seq_idx_ptrs += BLOCK_SIZE_K * stride_seq_idx_seqlen
+
     states = acc.to(states_ptr.dtype.element_ty)
 
     states_ptr += pid_c * stride_states_chunk + pid_h * stride_states_head
@@ -384,36 +380,35 @@ def _chunk_state_varlen_kernel(
     states_ptr,
     initstates_ptr,
     # Matrix dimensions
-    hdim,
-    dstate,
-    chunk_size,
-    seqlen,
-    nheads_ngroups_ratio,
+    hdim: tl.constexpr,
+    dstate: tl.constexpr,
+    chunk_size: tl.constexpr,
+    nheads_ngroups_ratio: tl.constexpr,
     # Strides
-    stride_x_seqlen,
-    stride_x_head,
-    stride_x_hdim,
-    stride_b_seqlen,
-    stride_b_head,
-    stride_b_dstate,
-    stride_dt_chunk,
+    stride_x_seqlen: tl.constexpr,
+    stride_x_head: tl.constexpr,
+    stride_x_hdim: tl.constexpr,
+    stride_b_seqlen: tl.constexpr,
+    stride_b_head: tl.constexpr,
+    stride_b_dstate: tl.constexpr,
+    stride_dt_chunk: tl.constexpr,
     stride_dt_head,
-    stride_dt_csize,
-    stride_dA_cs_chunk,
+    stride_dt_csize: tl.constexpr,
+    stride_dA_cs_chunk: tl.constexpr,
     stride_dA_cs_head,
-    stride_dA_cs_csize,
-    stride_chunk_states_chunk,
-    stride_chunk_states_head,
-    stride_chunk_states_hdim,
-    stride_chunk_states_dstate,
-    stride_states_batch,
-    stride_states_head,
-    stride_states_hdim,
-    stride_states_dstate,
-    stride_init_states_batch,
-    stride_init_states_head,
-    stride_init_states_hdim,
-    stride_init_states_dstate,
+    stride_dA_cs_csize: tl.constexpr,
+    stride_chunk_states_chunk: tl.constexpr,
+    stride_chunk_states_head: tl.constexpr,
+    stride_chunk_states_hdim: tl.constexpr,
+    stride_chunk_states_dstate: tl.constexpr,
+    stride_states_batch: tl.constexpr,
+    stride_states_head: tl.constexpr,
+    stride_states_hdim: tl.constexpr,
+    stride_states_dstate: tl.constexpr,
+    stride_init_states_batch: tl.constexpr,
+    stride_init_states_head: tl.constexpr,
+    stride_init_states_hdim: tl.constexpr,
+    stride_init_states_dstate: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -623,7 +618,7 @@ def _chunk_state_fwd(B,
         states = torch.empty((nchunks, nheads, headdim, dstate),
                              device=x.device,
                              dtype=states_dtype)
-    seq_idx_strides = ((seq_idx.stride(0), ) if seq_idx is not None else (0, ))
+
     grid = lambda META: (triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.
                          cdiv(dstate, META['BLOCK_SIZE_N']), nchunks, nheads)
     with torch.cuda.device(x.device.index):
@@ -655,8 +650,7 @@ def _chunk_state_fwd(B,
             stride_dA_cs_chunk=dA_cumsum.stride(1),
             stride_dA_cs_head=dA_cumsum.stride(0),
             stride_dA_cs_csize=dA_cumsum.stride(2),
-            stride_seq_idx_seqlen=seq_idx_strides[0],
-            HAS_SEQ_IDX=seq_idx is not None,
+            stride_seq_idx_seqlen=seq_idx.stride(0),
         )
     return states
 
@@ -688,46 +682,52 @@ def chunk_state_varlen(B,
                          dstate,
                          dtype=chunk_states.dtype,
                          device=chunk_states.device)
+
+    initial_states_strides = ((initial_states.stride(0),
+                               initial_states.stride(1),
+                               initial_states.stride(2),
+                               initial_states.stride(3))
+                              if initial_states is not None else (0, 0, 0, 0))
+
     grid = lambda META: (triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.
                          cdiv(dstate, META['BLOCK_SIZE_N']), batch, nheads)
     with torch.cuda.device(x.device.index):
         _chunk_state_varlen_kernel[grid](
-            x,
-            B,
-            dt,
-            dA_cumsum,
-            chunk_states,
-            cu_seqlens,
-            states,
-            initial_states,
-            headdim,
-            dstate,
-            chunk_size,
-            total_seqlen,
-            nheads // ngroups,
-            x.stride(0),
-            x.stride(1),
-            x.stride(2),
-            B.stride(0),
-            B.stride(1),
-            B.stride(2),
-            dt.stride(1),
-            dt.stride(0),
-            dt.stride(2),
-            dA_cumsum.stride(1),
-            dA_cumsum.stride(0),
-            dA_cumsum.stride(2),
-            chunk_states.stride(0),
-            chunk_states.stride(1),
-            chunk_states.stride(2),
-            chunk_states.stride(3),
-            states.stride(0),
-            states.stride(1),
-            states.stride(2),
-            states.stride(3),
-            *((initial_states.stride(0), initial_states.stride(1),
-               initial_states.stride(2),
-               initial_states.stride(3)) if initial_states is not None else
-              (0, 0, 0, 0)),
+            x_ptr=x,
+            b_ptr=B,
+            dt_ptr=dt,
+            dA_cumsum_ptr=dA_cumsum,
+            chunk_states_ptr=chunk_states,
+            cu_seqlens_ptr=cu_seqlens,
+            states_ptr=states,
+            initstates_ptr=initial_states,
+            hdim=headdim,
+            dstate=dstate,
+            chunk_size=chunk_size,
+            nheads_ngroups_ratio=nheads // ngroups,
+            stride_x_seqlen=x.stride(0),
+            stride_x_head=x.stride(1),
+            stride_x_hdim=x.stride(2),
+            stride_b_seqlen=B.stride(0),
+            stride_b_head=B.stride(1),
+            stride_b_dstate=B.stride(2),
+            stride_dt_chunk=dt.stride(1),
+            stride_dt_head=dt.stride(0),
+            stride_dt_csize=dt.stride(2),
+            stride_dA_cs_chunk=dA_cumsum.stride(1),
+            stride_dA_cs_head=dA_cumsum.stride(0),
+            stride_dA_cs_csize=dA_cumsum.stride(2),
+            stride_chunk_states_chunk=chunk_states.stride(0),
+            stride_chunk_states_head=chunk_states.stride(1),
+            stride_chunk_states_hdim=chunk_states.stride(2),
+            stride_chunk_states_dstate=chunk_states.stride(3),
+            stride_states_batch=states.stride(0),
+            stride_states_head=states.stride(1),
+            stride_states_hdim=states.stride(2),
+            stride_states_dstate=states.stride(3),
+            stride_init_states_batch=initial_states_strides[0],
+            stride_init_states_head=initial_states_strides[1],
+            stride_init_states_hdim=initial_states_strides[2],
+            stride_init_states_dstate=initial_states_strides[3],
             HAS_INITSTATES=initial_states is not None)
     return states

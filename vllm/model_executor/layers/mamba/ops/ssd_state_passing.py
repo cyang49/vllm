@@ -49,7 +49,6 @@ def _state_passing_fwd_kernel(
     stride_seq_idx_seqlen: tl.constexpr,
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
-    HAS_SEQ_IDX: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_h = tl.program_id(axis=1)
@@ -83,29 +82,28 @@ def _state_passing_fwd_kernel(
                              other=0.0).to(tl.float32)
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
         scale = tl.exp(dA_cs)
-        if HAS_SEQ_IDX:
-            # - the seq to pass forward is the one that is flushed to the right
-            #   boundary.
-            # - that is given by seq_idx_new below.
-            seq_idx_new = tl.load(seq_idx_ptr +
-                                  (min((c + 1) * chunk_size, seqlen) - 1) *
-                                  stride_seq_idx_seqlen)
-            if HAS_INITSTATES:
-                if seq_idx != seq_idx_new:
-                    # this means in the current chunk the rightmost flushed seq
-                    # has changed.
-                    # - so we do not propagate the state from previous chunk
-                    # - but rather we load that sequence's init state
-                    initstates_ptrs = initstates_ptr + seq_idx_new * stride_initstates_batch
 
-                    # - update state with seq_idx_new's init state
-                    states = tl.load(initstates_ptrs,
-                                     mask=offs_m < dim,
-                                     other=0.0).to(tl.float32)
-            else:
-                scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+        # - the seq to pass forward is the one that is flushed to the right
+        #   boundary.
+        # - that is given by seq_idx_new below.
+        seq_idx_new = tl.load(seq_idx_ptr +
+                              (min((c + 1) * chunk_size, seqlen) - 1) *
+                              stride_seq_idx_seqlen)
+        if HAS_INITSTATES:
+            if seq_idx != seq_idx_new:
+                # this means in the current chunk the rightmost flushed seq
+                # has changed.
+                # - so we do not propagate the state from previous chunk
+                # - but rather we load that sequence's init state
+                initstates_ptrs = initstates_ptr + seq_idx_new * stride_initstates_batch
 
-            seq_idx = seq_idx_new
+                # - update state with seq_idx_new's init state
+                states = tl.load(initstates_ptrs, mask=offs_m < dim,
+                                 other=0.0).to(tl.float32)
+        else:
+            scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+        seq_idx = seq_idx_new
+
         states = scale * states + new_states
         if c < nchunks - 1:
             tl.store(out_ptrs, states, mask=offs_m < dim)
@@ -133,11 +131,12 @@ def _state_passing_fwd(
     out = torch.empty((nchunks, nheads, dim),
                       device=states.device,
                       dtype=out_dtype)
+
     initial_states_strides = ((initial_states.stride(0),
                                initial_states.stride(1),
                                initial_states.stride(2))
                               if initial_states is not None else (0, 0, 0))
-    seq_idx_strides = ((seq_idx.stride(0), ) if seq_idx is not None else (0, ))
+
     grid = lambda META: (triton.cdiv(dim, META['BLOCK_SIZE']), nheads)
     with torch.cuda.device(states.device.index):
         _state_passing_fwd_kernel[grid](
@@ -161,8 +160,7 @@ def _state_passing_fwd(
             stride_initstates_batch=initial_states_strides[0],
             stride_initstates_head=initial_states_strides[1],
             stride_initstates_dim=initial_states_strides[2],
-            stride_seq_idx_seqlen=seq_idx_strides[0],
+            stride_seq_idx_seqlen=seq_idx.stride(0),
             HAS_INITSTATES=initial_states is not None,
-            HAS_SEQ_IDX=seq_idx is not None,
         )
     return out
