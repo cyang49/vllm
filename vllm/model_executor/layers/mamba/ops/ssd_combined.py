@@ -102,14 +102,15 @@ def _mamba_chunk_scan_combined_fwd(x,
     #   of the previous chunk. This implies that the first chunk of states is either 0
     #   or equal to init_states of the first example.
     states = _state_passing_fwd(
-        rearrange(states, "... p n -> ... (p n)"),
-        dA_cumsum[:, :, -1],
+        rearrange(states,
+                  "... p n -> ... (p n)"),  # (nchunks, nheads, headdim*dstate)
+        dA_cumsum[:, :, -1],  # (nheads, nchunks)
         initial_states=rearrange(initial_states, "... p n -> ... (p n)")
-        if initial_states is not None else None,
+        if initial_states is not None else
+        None,  # (batch, nheads, headdim*dstate)
         seq_idx=seq_idx,
         chunk_size=chunk_size,
-        out_dtype=C.dtype,
-        is_cont_batched=cu_seqlens is not None)
+        out_dtype=C.dtype)
     states = rearrange(states, "... (p n) -> ... p n", n=dstate)
 
     # 4. Compute batched matrix multiply for C_j^T B_i terms

@@ -77,7 +77,7 @@ def _state_passing_fwd_kernel(
     tl.store(out_ptrs, states, mask=offs_m < dim)
     out_ptrs += stride_out_chunk
     seq_idx = 0
-    for c in range(nchunks):
+    for c in range(nchunks - 1):
         new_states = tl.load(states_ptrs, mask=offs_m < dim,
                              other=0.0).to(tl.float32)
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
@@ -105,8 +105,7 @@ def _state_passing_fwd_kernel(
         seq_idx = seq_idx_new
 
         states = scale * states + new_states
-        if c < nchunks - 1:
-            tl.store(out_ptrs, states, mask=offs_m < dim)
+        tl.store(out_ptrs, states, mask=offs_m < dim)
 
         states_ptrs += stride_states_chunk
         dA_cs_ptr += stride_dA_cs_chunk
@@ -120,11 +119,9 @@ def _state_passing_fwd(
     chunk_size,
     initial_states=None,
     out_dtype=None,
-    is_cont_batched=False,
 ):
     nchunks, nheads, dim = states.shape
     assert dA_chunk_cumsum.shape == (nheads, nchunks)
-    assert is_cont_batched
     seqlen = seq_idx.shape[-1]
 
     out_dtype = states.dtype if out_dtype is None else out_dtype

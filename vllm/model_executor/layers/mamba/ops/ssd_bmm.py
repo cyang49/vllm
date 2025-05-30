@@ -143,6 +143,8 @@ def _bmm_chunk_fwd_kernel(
     chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # compute a * b.T
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs,
                     mask=(offs_m[:, None] < chunk_size_limit) &
@@ -159,6 +161,8 @@ def _bmm_chunk_fwd_kernel(
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
+    # Zero out the results that are not from the same request
+    # in the varlen batch
     seq_idx_m = tl.load(seq_idx_ptr + offs_m * stride_seq_idx_seqlen,
                         mask=offs_m < chunk_size_limit,
                         other=-1)
@@ -166,8 +170,8 @@ def _bmm_chunk_fwd_kernel(
                         mask=offs_n < chunk_size_limit,
                         other=-2)
     acc = tl.where(seq_idx_m[:, None] == seq_idx_n[None, :], acc, 0.0)
-    out = acc.to(out_ptr.dtype.element_ty)
 
+    out = acc.to(out_ptr.dtype.element_ty)
     out_ptr += pid_c * stride_out_chunk + pid_h * stride_out_head
     out_ptrs = out_ptr + (stride_outm * offs_m[:, None] +
                           offs_n[None, :] * stride_outn)

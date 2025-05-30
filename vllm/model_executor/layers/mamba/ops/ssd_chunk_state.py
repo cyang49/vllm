@@ -537,25 +537,21 @@ def _chunk_cumsum_fwd(dt,
                       dt_bias=None,
                       dt_softplus=False,
                       dt_limit=(0.0, float("inf"))):
-    # batch, seqlen, nheads = dt.shape
     seqlen, nheads = dt.shape
-    # assert batch == 1
     assert A.shape == (nheads, )
     if dt_bias is not None:
         assert dt_bias.shape == (nheads, )
     nchunks = math.ceil(seqlen / chunk_size)
-    dt_out = torch.empty(  #batch,
-        nheads,
-        nchunks,
-        chunk_size,
-        device=dt.device,
-        dtype=torch.float32)
-    dA_cumsum = torch.empty(  #batch,
-        nheads,
-        nchunks,
-        chunk_size,
-        device=dt.device,
-        dtype=torch.float32)
+    dt_out = torch.empty(nheads,
+                         nchunks,
+                         chunk_size,
+                         device=dt.device,
+                         dtype=torch.float32)
+    dA_cumsum = torch.empty(nheads,
+                            nchunks,
+                            chunk_size,
+                            device=dt.device,
+                            dtype=torch.float32)
     grid_chunk_cs = lambda META: (1, nchunks,
                                   triton.cdiv(nheads, META['BLOCK_SIZE_H']))
     with torch.cuda.device(dt.device.index):
@@ -595,15 +591,10 @@ def _chunk_state_fwd(B,
                      seq_idx=None,
                      states=None,
                      states_in_fp32=True):
-    # batch, seqlen, nheads, headdim = x.shape
-    # _, _, nchunks, chunk_size = dt.shape
-    # _, _, ngroups, dstate = B.shape
     seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
     _, ngroups, dstate = B.shape
     assert nheads % ngroups == 0
-    # assert B.shape == (batch, seqlen, ngroups, dstate)
-    # assert dt.shape == (batch, nheads, nchunks, chunk_size)
     assert B.shape == (seqlen, ngroups, dstate)
     assert dt.shape == (nheads, nchunks, chunk_size)
     assert dA_cumsum.shape == dt.shape
