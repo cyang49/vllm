@@ -21,6 +21,10 @@ class Mamba2Metadata:
     chunk_indices: torch.Tensor
     chunk_offsets: torch.Tensor
 
+    req_blocks: torch.Tensor
+    block_cu_seqlens: torch.Tensor
+    block_req_idx: torch.Tensor
+
 
 def get_platform_metadata_classes() -> tuple[type[AttentionMetadata], ...]:
     """Returns the appropriate metadata classes for the current platform."""
@@ -73,6 +77,48 @@ def _query_start_loc_to_chunk_indices_offsets(query_start_loc: torch.Tensor,
     return chunk_indices, chunk_offsets
 
 
+def _get_block_ranges(query_start_loc: torch.Tensor, block_size: int,
+                      sum_seqlens: int):
+    device = query_start_loc.device
+    seqlens = torch.diff(query_start_loc)
+    nreqs = len(seqlens)
+
+    # request level metadata
+    req_full_blocks = seqlens // block_size  # num of full blocks per request
+    req_full_lens = torch.full(
+        [nreqs], block_size,
+        device=device)  # num of tokens in full blocks of requests
+    req_rem_lens = seqlens % block_size  # num of tokens in remainder blocks
+    req_blocks = req_full_blocks + (req_rem_lens > 0
+                                    )  # num of blocks per request
+
+    # block level metadata
+    nblocks = req_blocks.sum()
+
+    block_seqlens = torch.repeat_interleave(
+        torch.stack((req_full_lens, req_rem_lens), dim=1).view(-1),
+        torch.stack((req_full_blocks, (req_rem_lens > 0)), dim=1).view(-1),
+        output_size=nblocks,
+    )
+
+    block_cu_seqlens = torch.cat([
+        torch.zeros([1], dtype=torch.int32, device=device),
+        torch.cumsum(block_seqlens, dim=0),
+    ])
+
+    # block to request index mapping
+    block_req_idx = torch.repeat_interleave(
+        torch.arange(nreqs, device=device),
+        req_blocks,
+        output_size=nblocks,
+    )
+
+    # sanity check
+    assert block_cu_seqlens[-1] == sum_seqlens
+
+    return req_blocks, block_cu_seqlens, block_req_idx
+
+
 def prepare_mamba2_metadata(
     chunk_size: int,
     attn_metadata: AttentionMetadata,
@@ -116,9 +162,15 @@ def prepare_mamba2_metadata(
                 _query_start_loc_to_chunk_indices_offsets(
                 query_start_loc, chunk_size, num_prefill_tokens)
 
+        req_blocks, block_cu_seqlens, block_req_idx = _get_block_ranges(
+            query_start_loc, chunk_size, num_prefill_tokens)
+
     return Mamba2Metadata(has_initial_states=has_initial_states,
                           prep_initial_states=prep_initial_states,
                           chunk_size=chunk_size,
                           seq_idx=seq_idx,
                           chunk_indices=chunk_indices,
-                          chunk_offsets=chunk_offsets)
+                          chunk_offsets=chunk_offsets,
+                          req_blocks=req_blocks,
+                          block_cu_seqlens=block_cu_seqlens,
+                          block_req_idx=block_req_idx)
