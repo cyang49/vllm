@@ -21,9 +21,10 @@ class Mamba2Metadata:
     chunk_indices: torch.Tensor
     chunk_offsets: torch.Tensor
 
-    req_blocks: torch.Tensor
+    req_nblocks: torch.Tensor
     block_cu_seqlens: torch.Tensor
     block_req_idx: torch.Tensor
+    block_ntokens: torch.Tensor
 
 
 def get_platform_metadata_classes() -> tuple[type[AttentionMetadata], ...]:
@@ -89,13 +90,13 @@ def _get_block_ranges(query_start_loc: torch.Tensor, block_size: int,
         [nreqs], block_size,
         device=device)  # num of tokens in full blocks of requests
     req_rem_lens = seqlens % block_size  # num of tokens in remainder blocks
-    req_blocks = req_full_blocks + (req_rem_lens > 0
-                                    )  # num of blocks per request
+    req_nblocks = req_full_blocks + (req_rem_lens > 0
+                                     )  # num of blocks per request
 
     # block level metadata
-    nblocks = req_blocks.sum()
+    nblocks = req_nblocks.sum()
 
-    block_seqlens = torch.repeat_interleave(
+    block_ntokens = torch.repeat_interleave(
         torch.stack((req_full_lens, req_rem_lens), dim=1).view(-1),
         torch.stack((req_full_blocks, (req_rem_lens > 0)), dim=1).view(-1),
         output_size=nblocks,
@@ -103,20 +104,20 @@ def _get_block_ranges(query_start_loc: torch.Tensor, block_size: int,
 
     block_cu_seqlens = torch.cat([
         torch.zeros([1], dtype=torch.int32, device=device),
-        torch.cumsum(block_seqlens, dim=0),
+        torch.cumsum(block_ntokens, dim=0),
     ])
 
     # block to request index mapping
     block_req_idx = torch.repeat_interleave(
         torch.arange(nreqs, device=device),
-        req_blocks,
+        req_nblocks,
         output_size=nblocks,
     )
 
     # sanity check
     assert block_cu_seqlens[-1] == sum_seqlens
 
-    return req_blocks, block_cu_seqlens, block_req_idx
+    return req_nblocks, block_cu_seqlens, block_req_idx, block_ntokens
 
 
 def prepare_mamba2_metadata(
@@ -131,6 +132,8 @@ def prepare_mamba2_metadata(
 
     seq_idx = None
     chunk_indices, chunk_offsets = None, None
+    req_nblocks, block_cu_seqlens, block_req_idx, block_ntokens = \
+        None, None, None, None
     # Need flags to indicate if there are initial states
     # currently we really only support the FlashAttention backend
     has_initial_states = None
@@ -162,8 +165,8 @@ def prepare_mamba2_metadata(
                 _query_start_loc_to_chunk_indices_offsets(
                 query_start_loc, chunk_size, num_prefill_tokens)
 
-        req_blocks, block_cu_seqlens, block_req_idx = _get_block_ranges(
-            query_start_loc, chunk_size, num_prefill_tokens)
+        req_nblocks, block_cu_seqlens, block_req_idx, block_ntokens = \
+            _get_block_ranges(query_start_loc, chunk_size, num_prefill_tokens)
 
     return Mamba2Metadata(has_initial_states=has_initial_states,
                           prep_initial_states=prep_initial_states,
@@ -171,6 +174,7 @@ def prepare_mamba2_metadata(
                           seq_idx=seq_idx,
                           chunk_indices=chunk_indices,
                           chunk_offsets=chunk_offsets,
-                          req_blocks=req_blocks,
+                          req_nblocks=req_nblocks,
                           block_cu_seqlens=block_cu_seqlens,
-                          block_req_idx=block_req_idx)
+                          block_req_idx=block_req_idx,
+                          block_ntokens=block_ntokens)

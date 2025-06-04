@@ -27,7 +27,27 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.mamba_cache import MambaCacheParams
 from vllm.model_executor.utils import set_weight_attrs
 
+# debugging
+
 # Added by the IBM Team, 2024
+
+
+# assume the input tensor is 2D and has shape (seqlen, hidden_dim)
+def varlen_batch_to_padded_blocks(input_tensor,
+                                  block_cu_seqlens,
+                                  block_size,
+                                  pad_value=None):
+    assert pad_value is None, "Other pad values not supported yet"
+
+    nblocks = len(block_cu_seqlens) - 1
+    hidden_dim = input_tensor.size(-1)
+    output_tensor = torch.zeros((nblocks, block_size, hidden_dim),
+                                dtype=input_tensor.dtype,
+                                device=input_tensor.device)
+    for i in range(nblocks):
+        bstart, bend = block_cu_seqlens[i], block_cu_seqlens[i + 1]
+        output_tensor[i, :(bend - bstart)] = input_tensor[bstart:bend]
+    return output_tensor
 
 
 # Adapted from transformers.models.mamba2.modeling_mamba2.MambaRMSNormGated
@@ -522,6 +542,98 @@ class MambaMixer2(CustomOp):
                     mamba2_metadata.has_initial_states[:, None, None, None],
                     mamba_cache_params.ssm_state[state_indices_tensor_p], 0)
 
+            # Padded blocks implementation
+            # reshaping 2d (seqlen, hdim) to 3d (nblocks, block_size, hdim)
+            nblocks = len(mamba2_metadata.block_cu_seqlens) - 1
+            block_size = mamba2_metadata.chunk_size
+            batch = len(mamba2_metadata.req_nblocks)
+            assert batch == num_prefills
+            x_x, dt_x, B_x, C_x = [
+                varlen_batch_to_padded_blocks(
+                    x,
+                    mamba2_metadata.block_cu_seqlens,
+                    block_size=block_size,
+                ) for x in (hidden_states_p, dt_p, B_p, C_p)
+            ]
+            x_x = x_x.view(nblocks, block_size, self.num_heads // self.tp_size,
+                           self.head_dim)
+            B_x, C_x = [
+                x.view(nblocks, block_size, self.n_groups // self.tp_size, -1)
+                for x in (B_x, C_x)
+            ]
+            # Repeat heads of B and C
+            B_x = B_x.repeat_interleave(self.num_heads // self.n_groups,
+                                        dim=2,
+                                        output_size=self.num_heads)
+            C_x = C_x.repeat_interleave(self.num_heads // self.n_groups,
+                                        dim=2,
+                                        output_size=self.num_heads)
+
+            # print(f"{attn_metadata.query_start_loc[:num_prefills + 1]}")
+            # print(f"{dt_x.shape=}")
+            # print(f"{B_x.shape=}")
+            # print(f"{C_x.shape=}")
+
+            # 1. block_cumsum_fwd
+            # dt_x: (nblocks, block_size, nheads)
+            # A: (nheads)
+            dt_x = nn.functional.softplus(dt_x + self.dt_bias).to(
+                torch.float32)
+            dt_x = torch.clamp(dt_x, 0.0, float("inf"))
+            dA = self.A.to(dt_x.dtype) * dt_x
+            # need to deal with out of bound values in dA
+            for i, n in enumerate(mamba2_metadata.block_ntokens):
+                if n < block_size:
+                    dA[i, n:] = 0.0
+            dA_cumsum = torch.cumsum(dA, dim=1)
+
+            # 2. block_state_fwd
+            # B_x: (nblocks, block_size, nheads, dstate)
+            # x_x: (nblocks, block_size, nheads, headdim)
+            # dt_x: (nblocks, block_size, nheads)
+            # dA_cumsum: (nblocks, block_size, nheads)
+            x_x = x_x.to(torch.float32)
+            decay_states = torch.exp(dA_cumsum[:, -1:, :] - dA_cumsum
+                                     ) * dt_x  # (nblocks, block_size, nheads)
+            B_decay = B_x * decay_states[
+                ..., None]  # (nblocks, block_size, nheads, dstate)
+            block_states = torch.einsum(
+                "nkhd,nkhs->nhds", x_x,
+                B_decay)  # (nblocks, nheads, headdim, dstate)
+
+            # 3. block_bmm_fwd
+            # B_x: (nblocks, block_size, nheads, dstate)
+            # C_x: (nblocks, block_size, nheads, dstate)
+            # Using c and b to distinguish block_size dimension
+            # in C and B accordingly
+            # CB: (nblocks, block_size, block_size, nheads)
+            # CB = torch.einsum("nchs,nbhs->ncbh", C_x, B_x)
+
+            # 4. state_passing_fwd (no dependency on step 3)
+            # block_states: (nblocks, nheads, headdim, dstate)
+            # dA_cumsum: (nblocks, block_size, nheads)
+            # initial_states: (num_prefills, nheads, headdim, dstate)
+
+            # Sequential implementation of state passing
+            block_start = 0
+            for i in range(num_prefills):
+                block_end = block_start + mamba2_metadata.req_nblocks[i]
+                prev_states = initial_states[i] \
+                    if initial_states is not None else None
+                for j in range(block_start, block_end):
+                    if prev_states is not None:
+                        block_decay = torch.exp(dA_cumsum[j,
+                                                          -1, :])  # (nheads,)
+                        block_states[j] += block_decay * prev_states
+                    prev_states = block_states[j]
+                block_start = block_end
+
+            varlen_states_x = block_states[mamba2_metadata.req_nblocks.cumsum(
+                dim=0) - 1]  # (num_prefills, nheads, headdim, dstate)
+            varlen_states_x = varlen_states_x.to(torch.half)
+            # 5. block_scan_fwd
+            # TODO: compute both diagonal output and off diagonal output
+
             scan_output, varlen_states = mamba_chunk_scan_combined_varlen(
                 hidden_states_p.view(num_prefill_tokens,
                                      self.num_heads // self.tp_size,
@@ -548,7 +660,7 @@ class MambaMixer2(CustomOp):
             # update ssm states
             # - varlen state is a (num_prefills, nheads, headdim, dstate) tensor
             mamba_cache_params.ssm_state[
-                state_indices_tensor_p] = varlen_states
+                state_indices_tensor_p] = varlen_states_x
 
             # - reshape
             ssd_output_list.append(scan_output.view(num_prefill_tokens, -1))
