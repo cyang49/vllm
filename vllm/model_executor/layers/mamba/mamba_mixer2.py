@@ -25,6 +25,9 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.mamba_cache import MambaCacheParams
 from vllm.model_executor.utils import set_weight_attrs
 
+from .fused_ops.fused_block_ssd import fused_block_ssd
+from .ops.ssd_combined import mamba_chunk_scan_combined_varlen
+
 # debugging
 
 # Added by the IBM Team, 2024
@@ -566,34 +569,41 @@ class MambaMixer2(CustomOp):
                                         dim=2,
                                         output_size=self.num_heads)
 
-            # 1. block_cumsum_fwd
-            # dt_x: (nblocks, block_size, nheads)
-            # A: (nheads)
-            dt_x = nn.functional.softplus(dt_x + self.dt_bias)
-            dt_x = torch.clamp(dt_x, 0.0, float("inf"))
-            dA = self.A.to(dt_x.dtype) * dt_x
-            # need to deal with out of bound values in dA
-            for i, n in enumerate(mamba2_metadata.block_ntokens):
-                if n < block_size:
-                    dA[i, n:] = 0.0
-            dA_cumsum = torch.cumsum(dA, dim=1)
+            x_p = hidden_states_p.view(num_prefill_tokens,
+                                       self.num_heads // self.tp_size,
+                                       self.head_dim)
+            dA_cumsum, block_states, CB = fused_block_ssd(
+                x=x_p,
+                dt=dt_p,
+                A=self.A,
+                B=B_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
+                           -1),
+                C=C_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
+                           -1),
+                block_size=block_size,
+                block_ntokens=mamba2_metadata.block_ntokens,
+                block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                dt_bias=self.dt_bias,
+                dt_softplus=True,
+                states_in_fp32=True,
+            )
 
-            # 2. block_state_fwd
-            # B_x: (nblocks, block_size, nheads, dstate)
-            # x_x: (nblocks, block_size, nheads, headdim)
-            # dt_x: (nblocks, block_size, nheads)
-            # dA_cumsum: (nblocks, block_size, nheads)
-            # x_x = x_x.to(torch.float32)
-            decay_states = (torch.exp(dA_cumsum[:, -1:, :] - dA_cumsum) * dt_x
-                            )  # (nblocks, block_size, nheads)
+            # Temporary code for layout conversions
+            dA_cumsum =  \
+                varlen_batch_to_padded_blocks(
+                    dA_cumsum,
+                    mamba2_metadata.block_cu_seqlens,
+                    block_size=block_size,
+                )
 
-            B_decay = (B_x * decay_states[..., None]
-                       )  # (nblocks, block_size, nheads, dstate)
-            block_states = torch.einsum(
-                "nkhd,nkhs->nhds", x_x,
-                B_decay)  # (nblocks, nheads, headdim, dstate)
+            CB = CB.repeat_interleave(self.num_heads // self.n_groups,
+                                      dim=1,
+                                      output_size=self.num_heads).permute(
+                                          0, 2, 3, 1)
+            # print(f"new {CB.shape=}")
+            # print(f"new {dA_cumsum.shape=}")
 
-            # 3. state_passing_fwd
+            # 4. state_passing_fwd
             # block_states: (nblocks, nheads, headdim, dstate)
             # dA_cumsum: (nblocks, block_size, nheads)
             # initial_states: (num_prefills, nheads, headdim, dstate)
@@ -619,85 +629,77 @@ class MambaMixer2(CustomOp):
             prev_states = torch.stack(prev_states)
             final_states = torch.stack(final_states)  # --> FINAL
 
-            # 4. block_bmm_fwd (for diagonal blocks)
-            # B_x: (nblocks, block_size, nheads, dstate)
-            # C_x: (nblocks, block_size, nheads, dstate)
-            # Using c and b to distinguish block_size dimension
-            # in C and B accordingly
-            # CB: (nblocks, block_size, block_size, nheads)
-            CB = torch.einsum("nchs,nbhs->ncbh", C_x, B_x)
+            # # 5. block_scan_fwd
+            # # Compute both diagonal output and off diagonal output
+            # # x_x: (nblocks, block_size, nheads, headdim)
+            # # dA_cumsum: (nblocks, block_size, nheads)
+            # # refer to https://tinyurl.com/yc2n32u9
+            # dt_segment_sum = dA_cumsum[:, :, None] - dA_cumsum[:, None, :]
+            # # (nblocks, block_size, block_size, nheads)
+            # decay = torch.exp(dt_segment_sum)
+            # scores_decay = CB * decay  # elementwise
+            # causal_mask = torch.tril(torch.ones(block_size,
+            #                                     block_size,
+            #                                     device=x_x.device,
+            #                                     dtype=bool),
+            #                          diagonal=0)
+            # scores_decay = scores_decay.masked_fill(
+            #     ~causal_mask[None, ..., None], 0)
+            # # Diagonal block contributions to the output
+            # out = torch.einsum('nlkh,nkh,nkhd->nlhd', scores_decay, dt_x,
+            #                    x_x)  # (nblocks, block_size, nheads, headdim)
 
-            # 5. block_scan_fwd
-            # Compute both diagonal output and off diagonal output
-            # x_x: (nblocks, block_size, nheads, headdim)
-            # dA_cumsum: (nblocks, block_size, nheads)
-            # refer to https://tinyurl.com/yc2n32u9
-            dt_segment_sum = dA_cumsum[:, :, None] - dA_cumsum[:, None, :]
-            # (nblocks, block_size, block_size, nheads)
-            decay = torch.exp(dt_segment_sum)
-            scores_decay = CB * decay  # elementwise
-            causal_mask = torch.tril(torch.ones(block_size,
-                                                block_size,
-                                                device=x_x.device,
-                                                dtype=bool),
-                                     diagonal=0)
-            scores_decay = scores_decay.masked_fill(
-                ~causal_mask[None, ..., None], 0)
-            # Diagonal block contributions to the output
-            out = torch.einsum('nlkh,nkh,nkhd->nlhd', scores_decay, dt_x,
-                               x_x)  # (nblocks, block_size, nheads, headdim)
+            # # C_x: (nblocks, block_size, nheads, dstate)
+            # # dA_cumsum: (nblocks, block_size, nheads)
+            # # prev_states: (nblocks, nheads, headdim, dstate)
+            # state_decay_out = torch.exp(
+            #     dA_cumsum[..., None])  # (nblocks, block_size, nheads, 1)
+            # # Off-diagonal block contributions to the output
+            # out_prev = torch.einsum(
+            #     'nlhs,nhds->nlhd', C_x, prev_states
+            # ) * state_decay_out  # (nblocks, block_size, nheads, headdim)
+            # # Sum up contributions
+            # out = out + out_prev
+            # if self.D is not None:
+            #     D = self.D
+            #     if D.dim() == 1:
+            #         D = D[..., None]
+            #     out = out + x_x * D
+            # # Remove padding
+            # out_blocks = [
+            #     x[:ntokens]
+            #     for (x, ntokens) in zip(out, mamba2_metadata.block_ntokens)
+            # ]
+            # scan_output = torch.vstack(out_blocks)  # --> FINAL
 
-            # C_x: (nblocks, block_size, nheads, dstate)
-            # dA_cumsum: (nblocks, block_size, nheads)
-            # prev_states: (nblocks, nheads, headdim, dstate)
-            state_decay_out = torch.exp(
-                dA_cumsum[..., None])  # (nblocks, block_size, nheads, 1)
-            # Off-diagonal block contributions to the output
-            out_prev = torch.einsum(
-                'nlhs,nhds->nlhd', C_x, prev_states
-            ) * state_decay_out  # (nblocks, block_size, nheads, headdim)
-            # Sum up contributions
-            out = out + out_prev
-            if self.D is not None:
-                D = self.D
-                if D.dim() == 1:
-                    D = D[..., None]
-                out = out + x_x * D
-            # Remove padding
-            out_blocks = [
-                x[:ntokens]
-                for (x, ntokens) in zip(out, mamba2_metadata.block_ntokens)
-            ]
-            scan_output = torch.vstack(out_blocks)  # --> FINAL
-
-            # scan_output, varlen_states = mamba_chunk_scan_combined_varlen(
-            #     hidden_states_p.view(num_prefill_tokens,
-            #                          self.num_heads // self.tp_size,
-            #                          self.head_dim),
-            #     dt_p,
-            #     self.A,
-            #     B_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
-            #              -1),
-            #     C_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
-            #              -1),
-            #     chunk_size=mamba2_metadata.chunk_size,
-            #     D=self.D,
-            #     z=None,
-            #     dt_bias=self.dt_bias,
-            #     seq_idx=mamba2_metadata.seq_idx.squeeze(0),
-            #     chunk_indices=mamba2_metadata.chunk_indices,
-            #     chunk_offsets=mamba2_metadata.chunk_offsets,
-            #     cu_seqlens=attn_metadata.query_start_loc[:num_prefills + 1],
-            #     initial_states=initial_states,
-            #     dt_softplus=True,
-            #     dt_limit=(0.0, float("inf")),
-            # )
+            scan_output, varlen_states = mamba_chunk_scan_combined_varlen(
+                hidden_states_p.view(num_prefill_tokens,
+                                     self.num_heads // self.tp_size,
+                                     self.head_dim),
+                dt_p,
+                self.A,
+                B_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
+                         -1),
+                C_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
+                         -1),
+                chunk_size=mamba2_metadata.chunk_size,
+                D=self.D,
+                z=None,
+                dt_bias=self.dt_bias,
+                seq_idx=mamba2_metadata.seq_idx.squeeze(0),
+                chunk_indices=mamba2_metadata.chunk_indices,
+                chunk_offsets=mamba2_metadata.chunk_offsets,
+                cu_seqlens=attn_metadata.query_start_loc[:num_prefills + 1],
+                initial_states=initial_states,
+                dt_softplus=True,
+                dt_limit=(0.0, float("inf")),
+            )
 
             # update ssm states
             # - varlen state is a (num_prefills, nheads, headdim, dstate) tensor
-            # mamba_cache_params.ssm_state[
-            #     state_indices_tensor_p] = varlen_states
-            mamba_cache_params.ssm_state[state_indices_tensor_p] = final_states
+            mamba_cache_params.ssm_state[
+                state_indices_tensor_p] = varlen_states
+            # mamba_cache_params.ssm_state[state_indices_tensor_p]=final_states
 
             # - reshape
             ssd_output_list.append(scan_output.view(num_prefill_tokens, -1))
