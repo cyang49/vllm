@@ -596,10 +596,10 @@ class MambaMixer2(CustomOp):
                     block_size=block_size,
                 )
 
-            CB = CB.repeat_interleave(self.num_heads // self.n_groups,
-                                      dim=1,
-                                      output_size=self.num_heads).permute(
-                                          0, 2, 3, 1)
+            # CB = CB.repeat_interleave(self.num_heads // self.n_groups,
+            #                           dim=1,
+            #                           output_size=self.num_heads).permute(
+            #                               0, 2, 3, 1)
             # print(f"new {CB.shape=}")
             # print(f"new {dA_cumsum.shape=}")
 
