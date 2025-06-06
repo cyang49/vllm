@@ -17,7 +17,7 @@ from vllm.triton_utils import tl, triton
 #   - d: headdim
 #   - s: dstate
 @triton.jit
-def fused_block_ssd_kernel(
+def fused_block_ssd_v0_kernel(
     # Inputs
     x_ptr,
     dt_ptr,
@@ -163,7 +163,6 @@ def fused_block_ssd_v2_kernel(
     B_ptr,
     C_ptr,
     block_cu_seqlens_ptr,
-    # block_ntokens_ptr,
     dt_bias_ptr,
     # Outputs
     dA_cumsum_ptr,
@@ -188,7 +187,6 @@ def fused_block_ssd_v2_kernel(
     stride_C_g: tl.constexpr,
     stride_C_s: tl.constexpr,
     stride_block_cu_seqlens_n: tl.constexpr,
-    # stride_block_ntokens_n: tl.constexpr,
     stride_dt_bias_h: tl.constexpr,
     stride_dA_cumsum_t: tl.constexpr,
     stride_dA_cumsum_h: tl.constexpr,
@@ -329,6 +327,183 @@ def fused_block_ssd_v2_kernel(
         tl.store(CB_ptrs, CB, mask=(mask_k[:, None] & mask_k[None, :]))
 
 
+@triton.jit
+def fused_block_ssd_v3_kernel(
+    # Inputs
+    x_ptr,
+    dt_ptr,
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    block_cu_seqlens_ptr,
+    dt_bias_ptr,
+    # Outputs
+    dA_cumsum_ptr,
+    block_states_ptr,
+    CB_ptr,
+    # Matrix dimensions
+    block_size: tl.constexpr,
+    headdim: tl.constexpr,
+    dstate: tl.constexpr,
+    nheads_ngroups_ratio: tl.constexpr,
+    # Strides
+    stride_x_t: tl.constexpr,
+    stride_x_h: tl.constexpr,
+    stride_x_d: tl.constexpr,
+    stride_dt_t: tl.constexpr,
+    stride_dt_h: tl.constexpr,
+    stride_A_h: tl.constexpr,
+    stride_B_t: tl.constexpr,
+    stride_B_g: tl.constexpr,
+    stride_B_s: tl.constexpr,
+    stride_C_t: tl.constexpr,
+    stride_C_g: tl.constexpr,
+    stride_C_s: tl.constexpr,
+    stride_block_cu_seqlens_n: tl.constexpr,
+    stride_dt_bias_h: tl.constexpr,
+    stride_dA_cumsum_t: tl.constexpr,
+    stride_dA_cumsum_h: tl.constexpr,
+    stride_block_states_n: tl.constexpr,
+    stride_block_states_h: tl.constexpr,
+    stride_block_states_d: tl.constexpr,
+    stride_block_states_s: tl.constexpr,
+    stride_CB_n: tl.constexpr,
+    stride_CB_g: tl.constexpr,
+    stride_CB_k0: tl.constexpr,
+    stride_CB_k1: tl.constexpr,
+    # Meta-parameters
+    HAS_DT_BIAS: tl.constexpr,
+    USE_DT_SOFTPLUS: tl.constexpr,
+    # finer grain decomposition of block size dimension
+    BLOCK_SIZE_KK: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_S: tl.constexpr,
+):
+    pid_n = tl.program_id(0)  # block idx
+    pid_h = tl.program_id(1)  # head idx
+    pid_g = pid_h % nheads_ngroups_ratio  # group idx
+
+    offs_k = tl.arange(0, block_size)
+    offs_kk = tl.arange(0, BLOCK_SIZE_KK)
+    offs_d = tl.arange(0, BLOCK_SIZE_D)
+    offs_s = tl.arange(0, BLOCK_SIZE_S)
+
+    # Load block start and end offset
+    t_start = tl.load(block_cu_seqlens_ptr + pid_n * stride_block_cu_seqlens_n)
+    t_end = tl.load(block_cu_seqlens_ptr +
+                    (pid_n + 1) * stride_block_cu_seqlens_n)
+    ntokens = t_end - t_start
+
+    # Mask out-of-bound tokens
+    mask_k = offs_k < ntokens
+    mask_d = offs_d < headdim
+    mask_s = offs_s < dstate
+
+    # Compute base pointer addresses
+    x_ptr += t_start * stride_x_t + pid_h * stride_x_h
+    dt_ptr += t_start * stride_dt_t + pid_h * stride_dt_h
+    A_ptr += pid_h * stride_A_h
+    B_ptr += t_start * stride_B_t + pid_g * stride_B_g
+    block_states_ptr += pid_n * stride_block_states_n + pid_h * stride_block_states_h
+
+    # Compute pointer arrays for blocks
+    dt_ptrs = dt_ptr + offs_k
+
+    # 1. dt and dA_cumsum computations
+    dt = tl.load(dt_ptrs, mask=mask_k,
+                 other=0.0).to(tl.float32)  # (block_size,)
+    if HAS_DT_BIAS:
+        dt_bias_ptr += pid_h * stride_dt_bias_h
+        dt_bias = tl.load(dt_bias_ptr).to(tl.float32)
+        dt += dt_bias
+    if USE_DT_SOFTPLUS:
+        dt = tl.where(dt <= 20.0, softplus(dt), dt)
+    dt = tl.clamp(dt, 0.0, float('inf'))
+
+    # reset out of bound values
+    dt = tl.where(mask_k, dt, 0.0)
+
+    A = tl.load(A_ptr).to(tl.float32)
+    dA = dt * A
+    dA_cs = tl.cumsum(dA, axis=0)
+    dA_cs_last = tl.sum(dA, axis=0)
+
+    dA_cumsum_ptr += t_start * stride_dA_cumsum_t + pid_h * stride_dA_cumsum_h
+    dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cumsum_t
+    tl.store(dA_cumsum_ptrs, dA_cs, mask=mask_k)
+
+    # 2. Compute block states
+
+    # Compute decay from dt and dA_cs
+    decay_states = tl.exp(dA_cs_last - dA_cs) * dt
+    decay_states = decay_states.reshape(block_size // BLOCK_SIZE_KK,
+                                        BLOCK_SIZE_KK)
+    offs_row = tl.arange(0, decay_states.shape[0])
+
+    # initiate accumulators
+    acc = tl.zeros((headdim, dstate), dtype=block_states_ptr.dtype.element_ty)
+
+    # Load the full block from C for loop fused CB tile calculation
+    C = tl.zeros((block_size, dstate), dtype=C_ptr.dtype.element_ty)
+    if pid_h % nheads_ngroups_ratio == 0:
+        C_ptr += t_start * stride_C_t + pid_g * stride_C_g
+        CB_ptr += pid_n * stride_CB_n + pid_g * stride_CB_g
+        C_ptrs = C_ptr + offs_k[:, None] * stride_C_t + \
+            offs_s[None, :] * stride_C_s  # (block_size, dstate)
+        C = tl.load(C_ptrs,
+                    mask=(mask_k[:, None] & mask_s[None, :]),
+                    other=0.0)
+
+    i = 0
+    # For each mini block kk
+    # process tokens within the length bound (ntokens)
+    for kk in range(0, ntokens, BLOCK_SIZE_KK):
+        mask_kk = offs_kk < (ntokens - kk)
+        x_ptr_kk = x_ptr + kk * stride_x_t
+        B_ptr_kk = B_ptr + kk * stride_B_t
+
+        x_ptrs = x_ptr_kk + offs_d[:, None] * stride_x_d + offs_kk[
+            None, :] * stride_x_t  # (headdim, BLOCK_SIZE_KK)
+        B_ptrs = B_ptr_kk + offs_kk[:, None] * stride_B_t + offs_s[
+            None, :] * stride_B_s  # (BLOCK_SIZE_KK, dstate)
+
+        x = tl.load(x_ptrs,
+                    mask=(mask_d[:, None] & mask_kk[None, :]),
+                    other=0.0).to(tl.float32)
+        B_kk = tl.load(B_ptrs,
+                       mask=(mask_kk[:, None] & mask_s[None, :]),
+                       other=0.0)
+
+        # Row selection work-around with masking
+        decay_states_kk = tl.where(
+            (offs_row == i)[:, None], decay_states,
+            0.0)  #((block_size//BLOCK_SIZE_KK), BLOCK_SIZE_KK,)
+        decay_states_kk = tl.sum(decay_states_kk, axis=0)  # (BLOCK_SIZE_KK,)
+
+        B_decay = B_kk.to(tl.float32) * decay_states_kk[:, None]
+
+        acc += tl.dot(x, B_decay)
+
+        # Increment row index
+        i += 1
+
+        # Loop-fused compute CB contribution per group
+        # (only one program per group does this)
+        if pid_h % nheads_ngroups_ratio == 0:
+            CB_ptr_kk = CB_ptr + kk * stride_CB_k1
+            CB_ptrs = CB_ptr_kk + offs_k[:, None] * stride_CB_k0 + \
+                offs_kk[None, :] * stride_CB_k1  # (block_size, BLOCK_SIZE_KK)
+            CB_kk = tl.dot(C, B_kk.T)  # (block_size, BLOCK_SIZE_KK)
+            tl.store(CB_ptrs, CB_kk, mask=(mask_k[:, None] & mask_kk[None, :]))
+            # TODO: Could the store within the loop become a bottleneck?
+
+    # Store back
+    block_states_ptrs = block_states_ptr + \
+        offs_d[:,None] * stride_block_states_d + \
+        offs_s[None, :] * stride_block_states_s
+    tl.store(block_states_ptrs, acc, mask=(mask_d[:, None] & mask_s[None, :]))
+
+
 # Fused block SSD performs intra-block computations on varlen input batch
 # The implementation uses block metadata to determine memory access ranges
 # Padding of sequences are not needed
@@ -345,7 +520,7 @@ def fused_block_ssd(
     dt_bias=None,  # (nheads, )
     dt_softplus=False,
     states_in_fp32=True,
-    block_size_kk=64,
+    block_size_kk=16,
 ):
     seqlen, nheads, headdim = x.shape
     ngroups = B.shape[1]
@@ -424,7 +599,7 @@ def fused_block_ssd(
     grid = (nblocks, nheads)
 
     with torch.cuda.device(x.device.index):
-        fused_block_ssd_v2_kernel[grid](
+        fused_block_ssd_v3_kernel[grid](
             x_ptr=x,
             dt_ptr=dt,
             A_ptr=A,
