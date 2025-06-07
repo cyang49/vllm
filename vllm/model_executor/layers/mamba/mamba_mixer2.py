@@ -572,7 +572,7 @@ class MambaMixer2(CustomOp):
             x_p = hidden_states_p.view(num_prefill_tokens,
                                        self.num_heads // self.tp_size,
                                        self.head_dim)
-            dA_cumsum, block_states, CB = fused_block_ssd(
+            dA_cumsum, block_states, _ = fused_block_ssd(
                 x=x_p,
                 dt=dt_p,
                 A=self.A,
@@ -586,6 +586,7 @@ class MambaMixer2(CustomOp):
                 dt_bias=self.dt_bias,
                 dt_softplus=True,
                 states_in_fp32=True,
+                FUSED_COMPUTE_CB=False,
             )
 
             # Temporary code for layout conversions

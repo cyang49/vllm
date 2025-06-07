@@ -63,6 +63,7 @@ def fused_block_ssd_v0_kernel(
     # Meta-parameters
     HAS_DT_BIAS: tl.constexpr,
     USE_DT_SOFTPLUS: tl.constexpr,
+    FUSED_COMPUTE_CB: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_S: tl.constexpr,
 ):
@@ -131,27 +132,28 @@ def fused_block_ssd_v0_kernel(
     B_decay = B.to(tl.float32) * decay_states[:, None]
 
     block_state = tl.dot(x, B_decay)
-    block_states_ptrs = block_states_ptr + offs_d[:,
-                                                  None] * stride_block_states_d + offs_s[
-                                                      None, :] * stride_block_states_s
+    block_states_ptrs = block_states_ptr + \
+        offs_d[:, None] * stride_block_states_d + \
+        offs_s[None, :] * stride_block_states_s
     tl.store(block_states_ptrs,
              block_state,
              mask=(mask_d[:, None] & mask_s[None, :]))
 
     # Compute CB matrix per group
-    if pid_h % nheads_ngroups_ratio == 0:
-        C_ptr += t_start * stride_C_t + pid_g * stride_C_g
-        CB_ptr += pid_n * stride_CB_n + pid_g * stride_CB_g
-        C_ptrs = C_ptr + offs_k[:, None] * stride_C_t + offs_s[
-            None, :] * stride_C_s  # (block_size, dstate)
-        CB_ptrs = CB_ptr + offs_k[:, None] * stride_CB_k0 + offs_k[
-            None, :] * stride_CB_k1  # (block_size, block_size)
-        C = tl.load(C_ptrs,
-                    mask=(mask_k[:, None] & mask_s[None, :]),
-                    other=0.0)
+    if FUSED_COMPUTE_CB:
+        if (pid_h % nheads_ngroups_ratio == 0):
+            C_ptr += t_start * stride_C_t + pid_g * stride_C_g
+            CB_ptr += pid_n * stride_CB_n + pid_g * stride_CB_g
+            C_ptrs = C_ptr + offs_k[:, None] * stride_C_t + offs_s[
+                None, :] * stride_C_s  # (block_size, dstate)
+            CB_ptrs = CB_ptr + offs_k[:, None] * stride_CB_k0 + offs_k[
+                None, :] * stride_CB_k1  # (block_size, block_size)
+            C = tl.load(C_ptrs,
+                        mask=(mask_k[:, None] & mask_s[None, :]),
+                        other=0.0)
 
-        CB = tl.dot(C, B.T)  # (block_size, block_size)
-        tl.store(CB_ptrs, CB, mask=(mask_k[:, None] & mask_k[None, :]))
+            CB = tl.dot(C, B.T)  # (block_size, block_size)
+            tl.store(CB_ptrs, CB, mask=(mask_k[:, None] & mask_k[None, :]))
 
 
 @triton.jit
@@ -201,6 +203,7 @@ def fused_block_ssd_v2_kernel(
     # Meta-parameters
     HAS_DT_BIAS: tl.constexpr,
     USE_DT_SOFTPLUS: tl.constexpr,
+    FUSED_COMPUTE_CB: tl.constexpr,
     # finer grain decomposition of block size dimension
     BLOCK_SIZE_KK: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
@@ -301,30 +304,31 @@ def fused_block_ssd_v2_kernel(
         i += 1
 
     # Store back
-    block_states_ptrs = block_states_ptr + offs_d[:,
-                                                  None] * stride_block_states_d + offs_s[
-                                                      None, :] * stride_block_states_s
+    block_states_ptrs = block_states_ptr + \
+        offs_d[:,None] * stride_block_states_d + \
+        offs_s[None, :] * stride_block_states_s
     tl.store(block_states_ptrs, acc, mask=(mask_d[:, None] & mask_s[None, :]))
 
     # Compute CB matrix per group
-    if pid_h % nheads_ngroups_ratio == 0:
-        B_ptrs = B_ptr + offs_k[:, None] * stride_B_t + offs_s[
-            None, :] * stride_B_s  # (block_size, dstate)
-        C_ptr += t_start * stride_C_t + pid_g * stride_C_g
-        CB_ptr += pid_n * stride_CB_n + pid_g * stride_CB_g
-        C_ptrs = C_ptr + offs_k[:, None] * stride_C_t + offs_s[
-            None, :] * stride_C_s  # (block_size, dstate)
-        CB_ptrs = CB_ptr + offs_k[:, None] * stride_CB_k0 + offs_k[
-            None, :] * stride_CB_k1  # (block_size, block_size)
-        C = tl.load(C_ptrs,
-                    mask=(mask_k[:, None] & mask_s[None, :]),
-                    other=0.0)
-        B = tl.load(B_ptrs,
-                    mask=(mask_k[:, None] & mask_s[None, :]),
-                    other=0.0)
+    if FUSED_COMPUTE_CB:
+        if (pid_h % nheads_ngroups_ratio == 0):
+            B_ptrs = B_ptr + offs_k[:, None] * stride_B_t + offs_s[
+                None, :] * stride_B_s  # (block_size, dstate)
+            C_ptr += t_start * stride_C_t + pid_g * stride_C_g
+            CB_ptr += pid_n * stride_CB_n + pid_g * stride_CB_g
+            C_ptrs = C_ptr + offs_k[:, None] * stride_C_t + offs_s[
+                None, :] * stride_C_s  # (block_size, dstate)
+            CB_ptrs = CB_ptr + offs_k[:, None] * stride_CB_k0 + offs_k[
+                None, :] * stride_CB_k1  # (block_size, block_size)
+            C = tl.load(C_ptrs,
+                        mask=(mask_k[:, None] & mask_s[None, :]),
+                        other=0.0)
+            B = tl.load(B_ptrs,
+                        mask=(mask_k[:, None] & mask_s[None, :]),
+                        other=0.0)
 
-        CB = tl.dot(C, B.T)  # (block_size, block_size)
-        tl.store(CB_ptrs, CB, mask=(mask_k[:, None] & mask_k[None, :]))
+            CB = tl.dot(C, B.T)  # (block_size, block_size)
+            tl.store(CB_ptrs, CB, mask=(mask_k[:, None] & mask_k[None, :]))
 
 
 @triton.jit
@@ -374,6 +378,7 @@ def fused_block_ssd_v3_kernel(
     # Meta-parameters
     HAS_DT_BIAS: tl.constexpr,
     USE_DT_SOFTPLUS: tl.constexpr,
+    FUSED_COMPUTE_CB: tl.constexpr,
     # finer grain decomposition of block size dimension
     BLOCK_SIZE_KK: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
@@ -445,14 +450,15 @@ def fused_block_ssd_v3_kernel(
 
     # Load the full block from C for loop fused CB tile calculation
     C = tl.zeros((block_size, dstate), dtype=C_ptr.dtype.element_ty)
-    if pid_h % nheads_ngroups_ratio == 0:
-        C_ptr += t_start * stride_C_t + pid_g * stride_C_g
-        CB_ptr += pid_n * stride_CB_n + pid_g * stride_CB_g
-        C_ptrs = C_ptr + offs_k[:, None] * stride_C_t + \
-            offs_s[None, :] * stride_C_s  # (block_size, dstate)
-        C = tl.load(C_ptrs,
-                    mask=(mask_k[:, None] & mask_s[None, :]),
-                    other=0.0)
+    if FUSED_COMPUTE_CB:
+        if (pid_h % nheads_ngroups_ratio == 0):
+            C_ptr += t_start * stride_C_t + pid_g * stride_C_g
+            CB_ptr += pid_n * stride_CB_n + pid_g * stride_CB_g
+            C_ptrs = C_ptr + offs_k[:, None] * stride_C_t + \
+                offs_s[None, :] * stride_C_s  # (block_size, dstate)
+            C = tl.load(C_ptrs,
+                        mask=(mask_k[:, None] & mask_s[None, :]),
+                        other=0.0)
 
     i = 0
     # For each mini block kk
@@ -489,13 +495,26 @@ def fused_block_ssd_v3_kernel(
 
         # Loop-fused compute CB contribution per group
         # (only one program per group does this)
-        if pid_h % nheads_ngroups_ratio == 0:
-            CB_ptr_kk = CB_ptr + kk * stride_CB_k1
-            CB_ptrs = CB_ptr_kk + offs_k[:, None] * stride_CB_k0 + \
-                offs_kk[None, :] * stride_CB_k1  # (block_size, BLOCK_SIZE_KK)
-            CB_kk = tl.dot(C, B_kk.T)  # (block_size, BLOCK_SIZE_KK)
-            tl.store(CB_ptrs, CB_kk, mask=(mask_k[:, None] & mask_kk[None, :]))
-            # TODO: Could the store within the loop become a bottleneck?
+        # TODO: The following code uses only 1 (and the same) thread block
+        #       for the CB block. However, it is possible to distribute these
+        #       among heads (of the same group)
+        #       for example, nheads=128, ngroups=1,
+        #                    block_size=256, block_size_kk=16
+        #       There are 256//16 = 16 tiles to compute and write
+        #       and they are embarrassingly parallel in this 1d decomposition
+        #       Should also consider using vector dot product instead of matrix
+        #       dot
+        if FUSED_COMPUTE_CB:
+            if (pid_h % nheads_ngroups_ratio == 0):
+                CB_ptr_kk = CB_ptr + kk * stride_CB_k1
+                CB_ptrs = CB_ptr_kk + \
+                    offs_k[:, None] * stride_CB_k0 + \
+                    offs_kk[None, :] * stride_CB_k1 #(block_size,BLOCK_SIZE_KK)
+                CB_kk = tl.dot(C, B_kk.T)  # (block_size, BLOCK_SIZE_KK)
+                tl.store(CB_ptrs,
+                         CB_kk,
+                         mask=(mask_k[:, None] & mask_kk[None, :]))
+                # TODO: Could the store within the loop become a bottleneck?
 
     # Store back
     block_states_ptrs = block_states_ptr + \
@@ -521,6 +540,7 @@ def fused_block_ssd(
     dt_softplus=False,
     states_in_fp32=True,
     block_size_kk=16,
+    FUSED_COMPUTE_CB=True,
 ):
     seqlen, nheads, headdim = x.shape
     ngroups = B.shape[1]
@@ -542,15 +562,17 @@ def fused_block_ssd(
         (nblocks, nheads, headdim, dstate),
         dtype=torch.float32 if states_in_fp32 else dtype,
         device=device)
-    CB = torch.empty((nblocks, ngroups, block_size, block_size),
-                     dtype=torch.float32,
-                     device=device)
 
-    # # Launch grid
-    # grid = (nblocks, nheads)
+    CB = (torch.empty((nblocks, ngroups, block_size, block_size),
+                      dtype=torch.float32,
+                      device=device) if FUSED_COMPUTE_CB else None)
+    CB_strides = (0, 0, 0, 0) if CB is None else (CB.stride(0), CB.stride(1),
+                                                  CB.stride(2), CB.stride(3))
+    # Launch grid
+    grid = (nblocks, nheads)
 
     # with torch.cuda.device(x.device.index):
-    #     fused_block_ssd_kernel[grid](
+    #     fused_block_ssd_v0_kernel[grid](
     #         x_ptr=x,
     #         dt_ptr=dt,
     #         A_ptr=A,
@@ -585,12 +607,13 @@ def fused_block_ssd(
     #         stride_block_states_h=block_states.stride(1),
     #         stride_block_states_d=block_states.stride(2),
     #         stride_block_states_s=block_states.stride(3),
-    #         stride_CB_n=CB.stride(0),
-    #         stride_CB_g=CB.stride(1),
-    #         stride_CB_k0=CB.stride(2),
-    #         stride_CB_k1=CB.stride(3),
+    #         stride_CB_n=CB_strides[0],
+    #         stride_CB_g=CB_strides[1],
+    #         stride_CB_k0=CB_strides[2],
+    #         stride_CB_k1=CB_strides[3],
     #         HAS_DT_BIAS=(dt_bias is not None),
     #         USE_DT_SOFTPLUS=dt_softplus,
+    #         FUSED_COMPUTE_CB=FUSED_COMPUTE_CB,
     #         BLOCK_SIZE_D=max(headdim, 16),
     #         BLOCK_SIZE_S=max(dstate, 16),
     #     )
@@ -634,12 +657,13 @@ def fused_block_ssd(
             stride_block_states_h=block_states.stride(1),
             stride_block_states_d=block_states.stride(2),
             stride_block_states_s=block_states.stride(3),
-            stride_CB_n=CB.stride(0),
-            stride_CB_g=CB.stride(1),
-            stride_CB_k0=CB.stride(2),
-            stride_CB_k1=CB.stride(3),
+            stride_CB_n=CB_strides[0],
+            stride_CB_g=CB_strides[1],
+            stride_CB_k0=CB_strides[2],
+            stride_CB_k1=CB_strides[3],
             HAS_DT_BIAS=(dt_bias is not None),
             USE_DT_SOFTPLUS=dt_softplus,
+            FUSED_COMPUTE_CB=FUSED_COMPUTE_CB,
             BLOCK_SIZE_KK=block_size_kk,
             BLOCK_SIZE_D=max(headdim, 16),
             BLOCK_SIZE_S=max(dstate, 16),
