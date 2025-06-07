@@ -25,18 +25,19 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.mamba_cache import MambaCacheParams
 from vllm.model_executor.utils import set_weight_attrs
 
+from .fused_ops.fused_block_ssd import fused_block_ssd
 from .ops.ssd_combined import mamba_chunk_scan_combined_varlen
-
-# debugging
 
 # Added by the IBM Team, 2024
 
 
+# debug helper function
 # assume the input tensor is 2D and has shape (seqlen, hidden_dim)
 def varlen_batch_to_padded_blocks(input_tensor,
                                   block_cu_seqlens,
                                   block_size,
-                                  pad_value=0.0):
+                                  pad_value=0.0,
+                                  repeat_last=False):
     nblocks = len(block_cu_seqlens) - 1
     hidden_dim = input_tensor.size(-1)
     output_tensor = torch.full((nblocks, block_size, hidden_dim),
@@ -45,7 +46,11 @@ def varlen_batch_to_padded_blocks(input_tensor,
                                device=input_tensor.device)
     for i in range(nblocks):
         bstart, bend = block_cu_seqlens[i], block_cu_seqlens[i + 1]
-        output_tensor[i, :(bend - bstart)] = input_tensor[bstart:bend]
+        ntokens = bend - bstart
+        output_tensor[i, :ntokens] = input_tensor[bstart:bend]
+        if repeat_last and ntokens != block_size:
+            output_tensor[i, ntokens:] = output_tensor[i, ntokens - 1]
+
     return output_tensor
 
 
@@ -568,61 +573,63 @@ class MambaMixer2(CustomOp):
                                         dim=2,
                                         output_size=self.num_heads)
 
-            # x_p = hidden_states_p.view(num_prefill_tokens,
-            #                            self.num_heads // self.tp_size,
-            #                            self.head_dim)
-            # dA_cumsum, _, _ = fused_block_ssd(
-            #     x=x_p,
-            #     dt=dt_p,
-            #     A=self.A,
-            #     B=B_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
-            #                -1),
-            #     C=C_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
-            #                -1),
-            #     block_size=block_size,
-            #     block_ntokens=mamba2_metadata.block_ntokens,
-            #     block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
-            #     dt_bias=self.dt_bias,
-            #     dt_softplus=True,
-            #     states_in_fp32=True,
-            #     FUSED_COMPUTE_CB=False,
-            #     block_size_kk=None, # no split along block size dim
-            # )
+            x_p = hidden_states_p.view(num_prefill_tokens,
+                                       self.num_heads // self.tp_size,
+                                       self.head_dim)
+            dA_cumsum, _, _ = fused_block_ssd(
+                x=x_p,
+                dt=dt_p,
+                A=self.A,
+                B=B_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
+                           -1),
+                C=C_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
+                           -1),
+                block_size=block_size,
+                block_ntokens=mamba2_metadata.block_ntokens,
+                block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                dt_bias=self.dt_bias,
+                dt_softplus=True,
+                states_in_fp32=True,
+                FUSED_COMPUTE_CB=False,
+                block_size_kk=None,  # no split along block size dim
+            )
 
-            # # Temporary code for layout conversions
-            # dA_cumsum =  \
-            #     varlen_batch_to_padded_blocks(
-            #         dA_cumsum,
-            #         mamba2_metadata.block_cu_seqlens,
-            #         block_size=block_size,
-            #     )
+            # Temporary code for layout conversions
+            dA_cumsum =  \
+                varlen_batch_to_padded_blocks(
+                    dA_cumsum,
+                    mamba2_metadata.block_cu_seqlens,
+                    block_size=block_size,
+                    repeat_last=True,
+                )
 
             # 1. block_cumsum_fwd
             # dt_x: (nblocks, block_size, nheads)
             # A: (nheads)
             dt_x = nn.functional.softplus(dt_x + self.dt_bias)
             dt_x = torch.clamp(dt_x, 0.0, float("inf"))
-            dA = self.A.to(dt_x.dtype) * dt_x
-            # need to deal with out of bound values in dA
-            for i, n in enumerate(mamba2_metadata.block_ntokens):
-                if n < block_size:
-                    dA[i, n:] = 0.0
-            dA_cumsum = torch.cumsum(dA, dim=1)
+
+            # 1.1 dA_cumsum computation
+            # dA = self.A.to(dt_x.dtype) * dt_x
+            # # need to deal with out of bound values in dA
+            # for i, n in enumerate(mamba2_metadata.block_ntokens):
+            #     if n < block_size:
+            #         dA[i, n:] = 0.0
+            # dA_cumsum_x = torch.cumsum(dA, dim=1)
 
             # 2. block_state_fwd
             # B_x: (nblocks, block_size, nheads, dstate)
             # x_x: (nblocks, block_size, nheads, headdim)
             # dt_x: (nblocks, block_size, nheads)
             # dA_cumsum: (nblocks, block_size, nheads)
-            # x_x = x_x.to(torch.float32)
+            x_x = x_x.to(torch.float32)
             decay_states = (torch.exp(dA_cumsum[:, -1:, :] - dA_cumsum) * dt_x
                             )  # (nblocks, block_size, nheads)
 
             B_decay = (B_x * decay_states[..., None]
                        )  # (nblocks, block_size, nheads, dstate)
-            block_states = torch.einsum(
-                "nkhd,nkhs->nhds", x_x,
-                B_decay)  # (nblocks, nheads, headdim, dstate)
+            block_states = torch.einsum("nkhd,nkhs->nhds", x_x, B_decay).to(
+                torch.float16)  # (nblocks, nheads, headdim, dstate)
 
             # CB = CB.repeat_interleave(self.num_heads // self.n_groups,
             #                           dim=1,
