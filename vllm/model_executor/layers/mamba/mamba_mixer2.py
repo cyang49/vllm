@@ -591,7 +591,7 @@ class MambaMixer2(CustomOp):
                 dt_softplus=True,
                 states_in_fp32=True,
                 FUSED_COMPUTE_CB=False,
-                block_size_kk=None,  # no split along block size dim
+                block_size_kk=16,  # no split along block size dim
             )
 
             # Temporary code for layout conversions
