@@ -559,6 +559,10 @@ def fused_block_ssd(
 
     # Allocate outputs
     dA_cumsum = torch.empty_like(dt, dtype=torch.float32)  # (seqlen, nheads)
+    # NOTE: block_states has nheads (and not ngroups), because each head in x
+    #       is paired with a group head in B (many-to-few) resulting in nheads
+    #       in the output states. This is different from GQA in regular
+    #       transformer KV cache where grouped KV is cached
     block_states = torch.empty(
         (nblocks, nheads, headdim, dstate),
         dtype=torch.float32 if states_in_fp32 else dtype,
