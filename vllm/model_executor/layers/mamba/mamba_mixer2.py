@@ -25,6 +25,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.mamba_cache import MambaCacheParams
 from vllm.model_executor.utils import set_weight_attrs
 
+from .fused_ops.fused_block_scan import fused_block_scan
 from .fused_ops.fused_block_ssd import fused_block_ssd
 from .ops.ssd_combined import mamba_chunk_scan_combined_varlen
 
@@ -550,7 +551,7 @@ class MambaMixer2(CustomOp):
             # reshaping 2d (seqlen, hdim) to 3d (nblocks, block_size, hdim)
             nblocks = len(mamba2_metadata.block_cu_seqlens) - 1
             block_size = mamba2_metadata.chunk_size
-            batch = len(mamba2_metadata.req_nblocks)
+            batch = len(mamba2_metadata.req_cu_nblocks) - 1
             assert batch == num_prefills
             x_x, dt_x, B_x, C_x = [
                 varlen_batch_to_padded_blocks(
@@ -576,7 +577,7 @@ class MambaMixer2(CustomOp):
             x_p = hidden_states_p.view(num_prefill_tokens,
                                        self.num_heads // self.tp_size,
                                        self.head_dim)
-            dA_cumsum, block_states, _ = fused_block_ssd(
+            dA_cumsum, block_states, CB = fused_block_ssd(
                 x=x_p,
                 dt=dt_p,
                 A=self.A,
@@ -590,19 +591,40 @@ class MambaMixer2(CustomOp):
                 dt_bias=self.dt_bias,
                 dt_softplus=True,
                 states_in_fp32=True,
-                FUSED_COMPUTE_CB=False,
+                FUSED_COMPUTE_CB=True,
                 block_size_kk=16,  # no split along block size dim
             )
 
-            # Temporary code for layout conversions
-            dA_cumsum =  \
-                varlen_batch_to_padded_blocks(
-                    dA_cumsum,
-                    mamba2_metadata.block_cu_seqlens,
-                    block_size=block_size,
-                    repeat_last=True,
-                )
-            block_states = block_states.to(torch.float16)
+            prev_states, final_states = fused_block_scan(
+                x=x_p,
+                dt=dt_p,
+                dA_cumsum=dA_cumsum,
+                block_states=block_states,
+                initial_states=initial_states,
+                C=C_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
+                           -1),
+                CB=CB,
+                block_ntokens=mamba2_metadata.block_ntokens,
+                block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                block_req_idx=mamba2_metadata.block_req_idx,
+                req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
+            )
+
+            # # Temporary code for layout conversions
+            # dA_cumsum =  \
+            #     varlen_batch_to_padded_blocks(
+            #         dA_cumsum,
+            #         mamba2_metadata.block_cu_seqlens,
+            #         block_size=block_size,
+            #         repeat_last=True,
+            #     )
+            # block_states = block_states.to(torch.float16)
+            varlen_states = final_states.to(torch.float16)
+
+            # print(f"{final_states[0, 0]=}")
+            # print(f"{final_states[-1, -1]=}")
+            # print(f"{prev_states[0, 0]=}")
+            # print(f"{prev_states[-1, -1]=}")
 
             # 1. block_cumsum_fwd
             # dt_x: (nblocks, block_size, nheads)
@@ -645,26 +667,31 @@ class MambaMixer2(CustomOp):
             # dA_cumsum: (nblocks, block_size, nheads)
             # initial_states: (num_prefills, nheads, headdim, dstate)
             # Sequential implementation of state passing
-            block_start = 0  # block index
-            prev_states = []
-            final_states = []
-            for i in range(num_prefills):
-                block_end = block_start + mamba2_metadata.req_nblocks[i]
-                prev_state = (initial_states[i] if initial_states is not None
-                              else torch.zeros_like(block_states[0]))
-                prev_states.append(prev_state)
+            # prev_states = []
+            # final_states = []
+            # for i in range(num_prefills):
+            #     block_start = mamba2_metadata.req_cu_nblocks[i]
+            #     block_end = mamba2_metadata.req_cu_nblocks[i+1]
+            #     prev_state = (initial_states[i] if initial_states is not None
+            #                   else torch.zeros_like(block_states[0]))
+            #     prev_states.append(prev_state)
 
-                for j in range(block_start, block_end):
-                    block_decay = torch.exp(dA_cumsum[j, -1, :])  # (nheads,)
-                    block_states[j] += block_decay * prev_state
-                    if j < block_end - 1:
-                        prev_states.append(block_states[j])
-                    prev_state = block_states[j]
+            #     for j in range(block_start, block_end):
+            #         block_decay = torch.exp(dA_cumsum[j, -1, :])  # (nheads,)
+            #         block_states[j] += block_decay * prev_state
+            #         if j < block_end - 1:
+            #             prev_states.append(block_states[j])
+            #         prev_state = block_states[j]
 
-                final_states.append(prev_state)
-                block_start = block_end
-            prev_states = torch.stack(prev_states)
-            varlen_states = torch.stack(final_states)  # --> FINAL
+            #     final_states.append(prev_state)
+
+            # prev_states = torch.stack(prev_states)
+            # varlen_states = torch.stack(final_states)  # --> FINAL
+            # varlen_states = varlen_states.to(torch.float16)
+            # print(f"x{varlen_states[0, 0]=}")
+            # print(f"x{varlen_states[-1, -1]=}")
+            # print(f"x{prev_states[0, 0]=}")
+            # print(f"x{prev_states[-1, -1]=}")
 
             # # 5. block_scan_fwd
             # # Compute both diagonal output and off diagonal output
