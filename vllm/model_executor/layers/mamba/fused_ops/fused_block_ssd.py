@@ -8,6 +8,7 @@ from vllm.model_executor.layers.mamba.ops.mamba_ssm import softplus
 from vllm.triton_utils import tl, triton
 
 
+# TODO: modularize common logic
 # Notations for readability
 #   - h: nheads
 #   - g: ngroups
@@ -69,7 +70,7 @@ def fused_block_ssd_v0_kernel(
 ):
     pid_n = tl.program_id(0)  # block idx
     pid_h = tl.program_id(1)  # head idx
-    pid_g = pid_h % nheads_ngroups_ratio  # group idx
+    pid_g = pid_h // nheads_ngroups_ratio  # group idx
 
     offs_k = tl.arange(0, block_size)
     offs_d = tl.arange(0, BLOCK_SIZE_D)
@@ -91,6 +92,7 @@ def fused_block_ssd_v0_kernel(
     dt_ptr += t_start * stride_dt_t + pid_h * stride_dt_h
     A_ptr += pid_h * stride_A_h
     B_ptr += t_start * stride_B_t + pid_g * stride_B_g
+    dA_cumsum_ptr += t_start * stride_dA_cumsum_t + pid_h * stride_dA_cumsum_h
     block_states_ptr += pid_n * stride_block_states_n + pid_h * stride_block_states_h
 
     # Compute pointer arrays for blocks
@@ -105,7 +107,7 @@ def fused_block_ssd_v0_kernel(
         dt += dt_bias
     if USE_DT_SOFTPLUS:
         dt = softplus(dt)
-    dt = tl.clamp(dt, 0.0, float('inf'))
+    dt = tl.clamp(dt, min=0.0, max=float('inf'))
 
     # reset out of bound values
     dt = tl.where(mask_k, dt, 0.0)
@@ -115,21 +117,21 @@ def fused_block_ssd_v0_kernel(
     dA_cs = tl.cumsum(dA, axis=0)
     dA_cs_last = tl.sum(dA, axis=0)
 
-    dA_cumsum_ptr += t_start * stride_dA_cumsum_t + pid_h * stride_dA_cumsum_h
     dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cumsum_t
     tl.store(dA_cumsum_ptrs, dA_cs, mask=mask_k)
 
     # Compute block states
-    x_ptrs = x_ptr + offs_d[:, None] * stride_x_d + offs_k[
-        None, :] * stride_x_t  # (headdim, block_size)
-    B_ptrs = B_ptr + offs_k[:, None] * stride_B_t + offs_s[
-        None, :] * stride_B_s  # (block_size, dstate)
+    x_ptrs = x_ptr + offs_d[:, None] * stride_x_d + \
+        offs_k[None, :] * stride_x_t  # (headdim, block_size)
+    B_ptrs = B_ptr + offs_k[:, None] * stride_B_t + \
+        offs_s[None, :] * stride_B_s  # (block_size, dstate)
     x = tl.load(x_ptrs, mask=(mask_d[:, None] & mask_k[None, :]),
                 other=0.0).to(tl.float32)
-    B = tl.load(B_ptrs, mask=(mask_k[:, None] & mask_s[None, :]), other=0.0)
+    B = tl.load(B_ptrs, mask=(mask_k[:, None] & mask_s[None, :]),
+                other=0.0).to(tl.float32)
 
     decay_states = tl.exp(dA_cs_last - dA_cs) * dt  # (block_size, )
-    B_decay = B.to(tl.float32) * decay_states[:, None]
+    B_decay = B * decay_states[:, None]
 
     block_state = tl.dot(x, B_decay)
     block_states_ptrs = block_states_ptr + \
@@ -139,21 +141,21 @@ def fused_block_ssd_v0_kernel(
              block_state,
              mask=(mask_d[:, None] & mask_s[None, :]))
 
-    # Compute CB matrix per group
-    if FUSED_COMPUTE_CB:
-        if (pid_h % nheads_ngroups_ratio == 0):
-            C_ptr += t_start * stride_C_t + pid_g * stride_C_g
-            CB_ptr += pid_n * stride_CB_n + pid_g * stride_CB_g
-            C_ptrs = C_ptr + offs_k[:, None] * stride_C_t + offs_s[
-                None, :] * stride_C_s  # (block_size, dstate)
-            CB_ptrs = CB_ptr + offs_k[:, None] * stride_CB_k0 + offs_k[
-                None, :] * stride_CB_k1  # (block_size, block_size)
-            C = tl.load(C_ptrs,
-                        mask=(mask_k[:, None] & mask_s[None, :]),
-                        other=0.0)
+    # # Compute CB matrix per group
+    # if FUSED_COMPUTE_CB:
+    #     if (pid_h % nheads_ngroups_ratio == 0):
+    #         C_ptr += t_start * stride_C_t + pid_g * stride_C_g
+    #         CB_ptr += pid_n * stride_CB_n + pid_g * stride_CB_g
+    #         C_ptrs = C_ptr + offs_k[:, None] * stride_C_t + offs_s[
+    #             None, :] * stride_C_s  # (block_size, dstate)
+    #         CB_ptrs = CB_ptr + offs_k[:, None] * stride_CB_k0 + offs_k[
+    #             None, :] * stride_CB_k1  # (block_size, block_size)
+    #         C = tl.load(C_ptrs,
+    #                     mask=(mask_k[:, None] & mask_s[None, :]),
+    #                     other=0.0)
 
-            CB = tl.dot(C, B.T)  # (block_size, block_size)
-            tl.store(CB_ptrs, CB, mask=(mask_k[:, None] & mask_k[None, :]))
+    #         CB = tl.dot(C, B.T)  # (block_size, block_size)
+    #         tl.store(CB_ptrs, CB, mask=(mask_k[:, None] & mask_k[None, :]))
 
 
 # @triton.jit
@@ -211,7 +213,7 @@ def fused_block_ssd_v0_kernel(
 # ):
 #     pid_n = tl.program_id(0)  # block idx
 #     pid_h = tl.program_id(1)  # head idx
-#     pid_g = pid_h % nheads_ngroups_ratio  # group idx
+#     pid_g = pid_h // nheads_ngroups_ratio  # group idx
 
 #     offs_k = tl.arange(0, block_size)
 #     offs_kk = tl.arange(0, BLOCK_SIZE_KK)
@@ -234,35 +236,31 @@ def fused_block_ssd_v0_kernel(
 #     dt_ptr += t_start * stride_dt_t + pid_h * stride_dt_h
 #     A_ptr += pid_h * stride_A_h
 #     B_ptr += t_start * stride_B_t + pid_g * stride_B_g
+#     dA_cumsum_ptr += t_start * stride_dA_cumsum_t + pid_h * stride_dA_cumsum_h
 #     block_states_ptr += pid_n * stride_block_states_n + pid_h * stride_block_states_h
 
 #     # Compute pointer arrays for blocks
 #     dt_ptrs = dt_ptr + offs_k * stride_dt_t
 
-#     # 1. dt and dA_cumsum computations
+#     # dt and dA_cumsum computations
 #     dt = tl.load(dt_ptrs, mask=mask_k,
-#                  other=0.0)#.to(tl.float32)  # (block_size,)
+#                  other=0.0).to(tl.float32)  # (block_size,)
 #     if HAS_DT_BIAS:
 #         dt_bias_ptr += pid_h * stride_dt_bias_h
-#         dt_bias = tl.load(dt_bias_ptr)#.to(tl.float32)
+#         dt_bias = tl.load(dt_bias_ptr)
 #         dt += dt_bias
 #     if USE_DT_SOFTPLUS:
-#         # dt = tl.where(dt <= 20.0, softplus(dt), dt)
 #         dt = softplus(dt)
-#     dt = tl.clamp(dt, 0.0, float('inf'))
+#     dt = tl.clamp(dt, min=0.0, max=float('inf'))
 
 #     # reset out of bound values
 #     dt = tl.where(mask_k, dt, 0.0)
-#     # why is this not enough for computing correct dA_cumsum?
 
-#     A = tl.load(A_ptr)#.to(tl.float32)
-#     # For some reason masking is required to set out of bound dA values
-#     # to get correct cumsum results
-#     dA = tl.where(mask_k, dt * A, 0.0)
+#     A = tl.load(A_ptr)
+#     dA = dt * A
 #     dA_cs = tl.cumsum(dA, axis=0)
 #     dA_cs_last = tl.sum(dA, axis=0)
 
-#     dA_cumsum_ptr += t_start * stride_dA_cumsum_t + pid_h * stride_dA_cumsum_h
 #     dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cumsum_t
 #     tl.store(dA_cumsum_ptrs, dA_cs, mask=mask_k)
 
@@ -292,7 +290,7 @@ def fused_block_ssd_v0_kernel(
 #                     other=0.0).to(tl.float32)
 #         B_kk = tl.load(B_ptrs,
 #                        mask=(mask_kk[:, None] & mask_s[None, :]),
-#                        other=0.0)
+#                        other=0.0).to(tl.float32)
 
 #         # Row selection work-around with masking
 #         decay_states_kk = tl.where(
@@ -300,7 +298,7 @@ def fused_block_ssd_v0_kernel(
 #             0.0)  #((block_size//BLOCK_SIZE_KK), BLOCK_SIZE_KK,)
 #         decay_states_kk = tl.sum(decay_states_kk, axis=0)  # (BLOCK_SIZE_KK,)
 
-#         B_decay = B_kk.to(tl.float32) * decay_states_kk[:, None]
+#         B_decay = B_kk * decay_states_kk[:, None]
 
 #         acc += tl.dot(x, B_decay)
 
@@ -389,10 +387,9 @@ def fused_block_ssd_v0_kernel(
 # ):
 #     pid_n = tl.program_id(0)  # block idx
 #     pid_h = tl.program_id(1)  # head idx
-#     pid_g = pid_h % nheads_ngroups_ratio  # group idx
+#     pid_g = pid_h // nheads_ngroups_ratio  # group idx
 
 #     offs_k = tl.arange(0, block_size)
-#     offs_kk = tl.arange(0, BLOCK_SIZE_KK)
 #     offs_d = tl.arange(0, BLOCK_SIZE_D)
 #     offs_s = tl.arange(0, BLOCK_SIZE_S)
 
@@ -412,32 +409,31 @@ def fused_block_ssd_v0_kernel(
 #     dt_ptr += t_start * stride_dt_t + pid_h * stride_dt_h
 #     A_ptr += pid_h * stride_A_h
 #     B_ptr += t_start * stride_B_t + pid_g * stride_B_g
+#     dA_cumsum_ptr += t_start * stride_dA_cumsum_t + pid_h * stride_dA_cumsum_h
 #     block_states_ptr += pid_n * stride_block_states_n + pid_h * stride_block_states_h
 
 #     # Compute pointer arrays for blocks
 #     dt_ptrs = dt_ptr + offs_k * stride_dt_t
 
-#     # 1. dt and dA_cumsum computations
+#     # dt and dA_cumsum computations
 #     dt = tl.load(dt_ptrs, mask=mask_k,
 #                  other=0.0).to(tl.float32)  # (block_size,)
 #     if HAS_DT_BIAS:
 #         dt_bias_ptr += pid_h * stride_dt_bias_h
-#         dt_bias = tl.load(dt_bias_ptr).to(tl.float32) # scalar
+#         dt_bias = tl.load(dt_bias_ptr)
 #         dt += dt_bias
 #     if USE_DT_SOFTPLUS:
-#         # dt = tl.where(dt <= 20.0, softplus(dt), dt)
 #         dt = softplus(dt)
-#     dt = tl.clamp(dt, 0.0, float('inf'))
+#     dt = tl.clamp(dt, min=0.0, max=float('inf'))
 
 #     # reset out of bound values
-#     dt = tl.where(mask_k, dt, 0.0) # (block_size,)
+#     dt = tl.where(mask_k, dt, 0.0)
 
-#     A = tl.load(A_ptr).to(tl.float32) # scalar
+#     A = tl.load(A_ptr)
 #     dA = dt * A
 #     dA_cs = tl.cumsum(dA, axis=0)
 #     dA_cs_last = tl.sum(dA, axis=0)
 
-#     dA_cumsum_ptr += t_start * stride_dA_cumsum_t + pid_h * stride_dA_cumsum_h
 #     dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cumsum_t
 #     tl.store(dA_cumsum_ptrs, dA_cs, mask=mask_k)
 

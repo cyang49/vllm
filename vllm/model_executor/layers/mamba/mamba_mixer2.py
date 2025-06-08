@@ -576,7 +576,7 @@ class MambaMixer2(CustomOp):
             x_p = hidden_states_p.view(num_prefill_tokens,
                                        self.num_heads // self.tp_size,
                                        self.head_dim)
-            dA_cumsum, _, _ = fused_block_ssd(
+            dA_cumsum, block_states, _ = fused_block_ssd(
                 x=x_p,
                 dt=dt_p,
                 A=self.A,
@@ -602,12 +602,13 @@ class MambaMixer2(CustomOp):
                     block_size=block_size,
                     repeat_last=True,
                 )
+            block_states = block_states.to(torch.float16)
 
             # 1. block_cumsum_fwd
             # dt_x: (nblocks, block_size, nheads)
             # A: (nheads)
-            dt_x = nn.functional.softplus(dt_x + self.dt_bias)
-            dt_x = torch.clamp(dt_x, 0.0, float("inf"))
+            # dt_x = nn.functional.softplus(dt_x + self.dt_bias)
+            # dt_x = torch.clamp(dt_x, 0.0, float("inf"))
 
             # 1.1 dA_cumsum computation
             # dA = self.A.to(dt_x.dtype) * dt_x
@@ -618,19 +619,20 @@ class MambaMixer2(CustomOp):
             # dA_cumsum_x = torch.cumsum(dA, dim=1)
 
             # 2. block_state_fwd
-            # B_x: (nblocks, block_size, nheads, dstate)
-            # x_x: (nblocks, block_size, nheads, headdim)
-            # dt_x: (nblocks, block_size, nheads)
-            # dA_cumsum: (nblocks, block_size, nheads)
-            x_x = x_x.to(torch.float32)
-            decay_states = (torch.exp(dA_cumsum[:, -1:, :] - dA_cumsum) * dt_x
-                            )  # (nblocks, block_size, nheads)
+            # # dA_cumsum: (nblocks, block_size, nheads)
+            # decay_states = (torch.exp(dA_cumsum[:, -1:, :] - dA_cumsum) * dt_x
+            #                 )  # (nblocks, block_size, nheads)
 
-            B_decay = (B_x * decay_states[..., None]
-                       )  # (nblocks, block_size, nheads, dstate)
-            block_states = torch.einsum("nkhd,nkhs->nhds", x_x, B_decay).to(
-                torch.float16)  # (nblocks, nheads, headdim, dstate)
+            # # x_x: (nblocks, block_size, nheads, headdim)
+            # # dt_x: (nblocks, block_size, nheads)
+            # # B_x: (nblocks, block_size, nheads, dstate)
+            # B_decay = (B_x * decay_states[..., None]
+            #            )  # (nblocks, block_size, nheads, dstate)
+            # x_x = x_x.to(torch.float32)
+            # block_states_x = torch.einsum("nkhd,nkhs->nhds", x_x, B_decay).to(
+            #     torch.float16)  # (nblocks, nheads, headdim, dstate)
 
+            # assert torch.allclose(block_states, block_states_x, atol=1e-2)
             # CB = CB.repeat_interleave(self.num_heads // self.n_groups,
             #                           dim=1,
             #                           output_size=self.num_heads).permute(
