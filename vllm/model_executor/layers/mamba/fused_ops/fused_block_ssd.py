@@ -119,6 +119,7 @@ def fused_block_ssd_v0_kernel(
 
     dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cumsum_t
     tl.store(dA_cumsum_ptrs, dA_cs, mask=mask_k)
+    tl.store(dt_ptrs, dt, mask=mask_k)
 
     # Compute block states
     x_ptrs = x_ptr + offs_d[:, None] * stride_x_d + \
@@ -152,7 +153,7 @@ def fused_block_ssd_v0_kernel(
                 None, :] * stride_CB_k1  # (block_size, block_size)
             C = tl.load(C_ptrs,
                         mask=(mask_k[:, None] & mask_s[None, :]),
-                        other=0.0)
+                        other=0.0).to(tl.float32)
 
             CB = tl.dot(C, B.T)  # (block_size, block_size)
             tl.store(CB_ptrs, CB, mask=(mask_k[:, None] & mask_k[None, :]))
@@ -263,6 +264,7 @@ def fused_block_ssd_v2_kernel(
 
     dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cumsum_t
     tl.store(dA_cumsum_ptrs, dA_cs, mask=mask_k)
+    tl.store(dt_ptrs, dt, mask=mask_k)
 
     # 2. Compute block states
 
@@ -437,6 +439,7 @@ def fused_block_ssd_v2_kernel(
 
 #     dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cumsum_t
 #     tl.store(dA_cumsum_ptrs, dA_cs, mask=mask_k)
+#     tl.store(dt_ptrs, dt, mask=mask_k)
 
 #     # 2. Compute block states
 
@@ -527,6 +530,7 @@ def fused_block_ssd_v2_kernel(
 # Fused block SSD performs intra-block computations on varlen input batch
 # The implementation uses block metadata to determine memory access ranges
 # Padding of sequences are not needed
+# NOTE: this function updates dt in-place
 def fused_block_ssd(
     x,  # (seqlen, nheads, headdim)
     dt,  # (seqlen, nheads)

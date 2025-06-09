@@ -566,6 +566,7 @@ class MambaMixer2(CustomOp):
                 x.view(nblocks, block_size, self.n_groups // self.tp_size, -1)
                 for x in (B_x, C_x)
             ]
+
             # Repeat heads of B and C
             B_x = B_x.repeat_interleave(self.num_heads // self.n_groups,
                                         dim=2,
@@ -577,9 +578,11 @@ class MambaMixer2(CustomOp):
             x_p = hidden_states_p.view(num_prefill_tokens,
                                        self.num_heads // self.tp_size,
                                        self.head_dim)
+            # make a clone because fused_block_ssd updates dt in-place
+            dt_copy = dt_p.clone()
             dA_cumsum, block_states, CB = fused_block_ssd(
                 x=x_p,
-                dt=dt_p,
+                dt=dt_copy,
                 A=self.A,
                 B=B_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
                            -1),
@@ -595,20 +598,24 @@ class MambaMixer2(CustomOp):
                 block_size_kk=16,  # no split along block size dim
             )
 
-            prev_states, final_states = fused_block_scan(
+            # NOTE: CB result looks fine
+            prev_states, final_states, output = fused_block_scan(
                 x=x_p,
-                dt=dt_p,
+                dt=dt_copy,
                 dA_cumsum=dA_cumsum,
                 block_states=block_states,
                 initial_states=initial_states,
                 C=C_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
                            -1),
+                D=self.D,
                 CB=CB,
-                block_ntokens=mamba2_metadata.block_ntokens,
                 block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
                 block_req_idx=mamba2_metadata.block_req_idx,
                 req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
+                return_prev_states=True,
             )
+
+            varlen_states = final_states.to(torch.float16)
 
             # # Temporary code for layout conversions
             # dA_cumsum =  \
@@ -618,13 +625,11 @@ class MambaMixer2(CustomOp):
             #         block_size=block_size,
             #         repeat_last=True,
             #     )
-            # block_states = block_states.to(torch.float16)
-            varlen_states = final_states.to(torch.float16)
-
-            # print(f"{final_states[0, 0]=}")
-            # print(f"{final_states[-1, -1]=}")
-            # print(f"{prev_states[0, 0]=}")
-            # print(f"{prev_states[-1, -1]=}")
+            # if CB is not None:
+            #     CB = CB.repeat_interleave(self.num_heads // self.n_groups,
+            #                             dim=1,
+            #                             output_size=self.num_heads).permute(
+            #                                 0, 2, 3, 1)
 
             # 1. block_cumsum_fwd
             # dt_x: (nblocks, block_size, nheads)
@@ -655,12 +660,6 @@ class MambaMixer2(CustomOp):
             #     torch.float16)  # (nblocks, nheads, headdim, dstate)
 
             # assert torch.allclose(block_states, block_states_x, atol=1e-2)
-            # CB = CB.repeat_interleave(self.num_heads // self.n_groups,
-            #                           dim=1,
-            #                           output_size=self.num_heads).permute(
-            #                               0, 2, 3, 1)
-            # print(f"new {CB.shape=}")
-            # print(f"new {dA_cumsum.shape=}")
 
             # 4. state_passing_fwd
             # block_states: (nblocks, nheads, headdim, dstate)
@@ -688,16 +687,13 @@ class MambaMixer2(CustomOp):
             # prev_states = torch.stack(prev_states)
             # varlen_states = torch.stack(final_states)  # --> FINAL
             # varlen_states = varlen_states.to(torch.float16)
-            # print(f"x{varlen_states[0, 0]=}")
-            # print(f"x{varlen_states[-1, -1]=}")
-            # print(f"x{prev_states[0, 0]=}")
-            # print(f"x{prev_states[-1, -1]=}")
 
             # # 5. block_scan_fwd
             # # Compute both diagonal output and off diagonal output
             # # x_x: (nblocks, block_size, nheads, headdim)
             # # dA_cumsum: (nblocks, block_size, nheads)
             # # refer to https://tinyurl.com/yc2n32u9
+            # CB = torch.einsum("nchs,nbhs->ncbh", C_x, B_x)
             # dt_segment_sum = dA_cumsum[:, :, None] - dA_cumsum[:, None, :]
             # # (nblocks, block_size, block_size, nheads)
             # decay = torch.exp(dt_segment_sum)
@@ -710,8 +706,10 @@ class MambaMixer2(CustomOp):
             # scores_decay = scores_decay.masked_fill(
             #     ~causal_mask[None, ..., None], 0)
             # # Diagonal block contributions to the output
-            # out = torch.einsum('nlkh,nkh,nkhd->nlhd', scores_decay, dt_x,
-            #                    x_x)  # (nblocks, block_size, nheads, headdim)
+            # out = torch.einsum('nlkh,nkh,nkhd->nlhd',
+            #                    scores_decay.to(torch.float16),
+            #                    dt_x, x_x)
+            # # (nblocks, block_size, nheads, headdim)
 
             # # C_x: (nblocks, block_size, nheads, dstate)
             # # dA_cumsum: (nblocks, block_size, nheads)
@@ -720,10 +718,11 @@ class MambaMixer2(CustomOp):
             #     dA_cumsum[..., None])  # (nblocks, block_size, nheads, 1)
             # # Off-diagonal block contributions to the output
             # out_prev = torch.einsum(
-            #     'nlhs,nhds->nlhd', C_x, prev_states
+            #     'nlhs,nhds->nlhd', C_x, prev_states.to(torch.float16)
             # ) * state_decay_out  # (nblocks, block_size, nheads, headdim)
             # # Sum up contributions
             # out = out + out_prev
+            # out = out.to(torch.float16)
             # if self.D is not None:
             #     D = self.D
             #     if D.dim() == 1:
