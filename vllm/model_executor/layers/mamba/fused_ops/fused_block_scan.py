@@ -157,7 +157,6 @@ def fused_block_scan_v0_kernel(
                             mask=(mask_d[:, None] & mask_s[None, :]),
                             other=0.0)
             state += block_decay * prev_state
-            prev_state = state
 
             # store to final state if last block in sequence
             if t == (block_end - 1):
@@ -169,6 +168,9 @@ def fused_block_scan_v0_kernel(
                 tl.store(final_states_ptrs,
                          state,
                          mask=(mask_d[:, None] & mask_s[None, :]))
+            elif (t < pid_n):
+                # update prev_state only if it's not the last
+                prev_state = state
 
     # 2. compute output
     # start and end token index in seqlen dimension
@@ -186,32 +188,31 @@ def fused_block_scan_v0_kernel(
         pid_n * stride_CB_n + pid_g * stride_CB_g +
         offs_t[:, None] * stride_CB_k0 + offs_t[None, :] * stride_CB_k1
     )  # (block_size, block_size)
-    C_ptrs = C_ptr + (pid_g * stride_C_g +
-                      (t_start + offs_t[:, None]) * stride_C_t +
-                      offs_s[None, :] * stride_C_s)  # (block_size, dstate)
 
     # Load inputs
     x = tl.load(x_ptrs, mask=(mask_t[:, None] & mask_d[None, :]), other=0.0)
     dt = tl.load(dt_ptrs, mask=mask_t, other=0.0)
     dA_cumsum = tl.load(dA_cumsum_ptrs, mask=mask_t, other=0.0)
-    CB = tl.load(CB_ptrs, mask=(mask_t[:, None] & mask_t[None, :]),
-                 other=0.0).to(tl.float16)
-    C = tl.load(C_ptrs, mask=(mask_t[:, None] & mask_s[None, :]),
-                other=0.0).to(tl.float16)
+    CB = tl.load(CB_ptrs, mask=(mask_t[:, None] & mask_t[None, :]), other=0.0)
 
     # 2.1 compute diagonal output contribution
     seg_sum = dA_cumsum[:,
                         None] - dA_cumsum[None, :]  #(block_size, block_size)
     decay = tl.exp(seg_sum)
-
-    scores_decay = tl.where((offs_t[:, None] >= offs_t[None, :]),
-                            CB * decay.to(tl.float16), 0.0)
-    scores = scores_decay * dt[:, None]
+    scores = tl.where((offs_t[:, None] >= offs_t[None, :]),
+                      CB * decay * dt[:, None], 0.0)
+    # lower precision
+    scores = scores.to(tl.float16)
     out_diag = tl.dot(scores, x)  # (block_size, headdim)
 
     # 2.2 compute off-diagonal block contributions to the output
-    out_off = tl.dot(C.to(tl.float32),
-                     prev_state.T) * dA_cumsum[:, None]  #(block_size, headdim)
+    C_ptrs = C_ptr + (pid_g * stride_C_g +
+                      (t_start + offs_t[:, None]) * stride_C_t +
+                      offs_s[None, :] * stride_C_s)  # (block_size, dstate)
+    C = tl.load(C_ptrs, mask=(mask_t[:, None] & mask_s[None, :]),
+                other=0.0).to(tl.float32)
+    out_off = tl.dot(C, prev_state.T) * dA_cumsum[:,
+                                                  None]  #(block_size, headdim)
 
     # 2.3 sum up contributions
     out = out_diag + out_off  # (block_size, headdim)
@@ -223,7 +224,9 @@ def fused_block_scan_v0_kernel(
     out_ptrs = output_ptr + (pid_h * stride_output_h +
                              (t_start + offs_t[:, None]) * stride_output_t +
                              offs_d[None, :] * stride_output_d)
-    tl.store(out_ptrs, out_off, mask=(mask_t[:, None] & mask_d[None, :]))
+    # tl.store(out_ptrs, out_diag, mask=(mask_t[:, None] & mask_d[None, :]))
+    # tl.store(out_ptrs, out_off, mask=(mask_t[:, None] & mask_d[None, :]))
+    tl.store(out_ptrs, out_diag, mask=(mask_t[:, None] & mask_d[None, :]))
 
 
 # Fused block SSD performs inter-block scan and final output activation

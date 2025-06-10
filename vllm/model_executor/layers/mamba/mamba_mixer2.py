@@ -599,7 +599,7 @@ class MambaMixer2(CustomOp):
             )
 
             # NOTE: CB result looks fine
-            prev_states, final_states, output = fused_block_scan(
+            prev_states, final_states, scan_output = fused_block_scan(
                 x=x_p,
                 dt=dt_copy,
                 dA_cumsum=dA_cumsum,
@@ -614,11 +614,14 @@ class MambaMixer2(CustomOp):
                 req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
                 return_prev_states=True,
             )
-            # print(f"{prev_states[0, 0, 0]=}")
-            # print(f"{final_states[0, 0, 0]=}")
+            print(f"{mamba2_metadata.block_cu_seqlens=}")
+            print(f"{mamba2_metadata.req_cu_nblocks=}")
+            print(f"{scan_output[0, 0]=}")
+            print(f"{scan_output[1, 0]=}")
+            print(f"{scan_output[-1, 0]=}")
             varlen_states = final_states.to(torch.float16)
 
-            # # Temporary code for layout conversions
+            # Temporary code for layout conversions
             dA_cumsum =  \
                 varlen_batch_to_padded_blocks(
                     dA_cumsum,
@@ -719,8 +722,15 @@ class MambaMixer2(CustomOp):
             out = torch.einsum('nlkh,nkh,nkhd->nlhd',
                                scores_decay.to(torch.float16), dt_x, x_x)
             # (nblocks, block_size, nheads, headdim)
-            # print(f"x {prev_states[0, 0, 0]=}")
-            # print(f"x {varlen_states[0, 0, 0]=}")
+            out_diag_blocks = [
+                x[:ntokens]
+                for (x, ntokens) in zip(out, mamba2_metadata.block_ntokens)
+            ]
+            out_diag = torch.vstack(out_diag_blocks)
+            print(f"{out_diag[0, 0]=}")
+            print(f"{out_diag[1, 0]=}")
+            print(f"{out_diag[-1, 0]=}")
+
             # C_x: (nblocks, block_size, nheads, dstate)
             # dA_cumsum: (nblocks, block_size, nheads)
             # prev_states: (nblocks, nheads, headdim, dstate)
@@ -732,6 +742,14 @@ class MambaMixer2(CustomOp):
             ) * state_decay_out  # (nblocks, block_size, nheads, headdim)
             # Sum up contributions
             out = out + out_prev
+            # out_perv_blocks = [
+            #     x[:ntokens]
+            #     for (x, ntokens) in zip(out_prev,
+            #                             mamba2_metadata.block_ntokens)
+            # ]
+            # out_prev = torch.vstack(out_perv_blocks)
+            # print(f"{out_prev[0, 0]=}")
+            # print(f"{out_prev[-1, -1]=}")
             out = out.to(torch.float16)
             if self.D is not None:
                 D = self.D
@@ -743,8 +761,10 @@ class MambaMixer2(CustomOp):
                 x[:ntokens]
                 for (x, ntokens) in zip(out, mamba2_metadata.block_ntokens)
             ]
-            scan_output = torch.vstack(out_blocks)  # --> FINAL
 
+            scan_output = torch.vstack(out_blocks)  # --> FINAL
+            # print(f"x{scan_output[0, 0]=}")
+            # print(f"x{scan_output[-1, 0]=}")
             # scan_output, _ = mamba_chunk_scan_combined_varlen(
             #     hidden_states_p.view(num_prefill_tokens,
             #                          self.num_heads // self.tp_size,
