@@ -42,6 +42,7 @@ def fused_block_scan_v0_kernel(
     prev_states_ptr,
     final_states_ptr,
     output_ptr,
+    debug_block_ptr,
     # Matrix dimensions
     block_size: tl.constexpr,
     headdim: tl.constexpr,
@@ -85,6 +86,10 @@ def fused_block_scan_v0_kernel(
     stride_output_t: tl.constexpr,
     stride_output_h: tl.constexpr,
     stride_output_d: tl.constexpr,
+    stride_debug_block_n: tl.constexpr,
+    stride_debug_block_h: tl.constexpr,
+    stride_debug_block_k0: tl.constexpr,
+    stride_debug_block_k1: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_S: tl.constexpr,
@@ -195,12 +200,20 @@ def fused_block_scan_v0_kernel(
     dA_cumsum = tl.load(dA_cumsum_ptrs, mask=mask_t, other=0.0)
     CB = tl.load(CB_ptrs, mask=(mask_t[:, None] & mask_t[None, :]), other=0.0)
 
+    # DEBUG
+    debug_block_ptrs = debug_block_ptr + (
+        pid_n * stride_debug_block_n + pid_h * stride_debug_block_h +
+        offs_t[:, None] * stride_debug_block_k0 +
+        offs_t[None, :] * stride_debug_block_k1)
+
     # 2.1 compute diagonal output contribution
     seg_sum = dA_cumsum[:,
                         None] - dA_cumsum[None, :]  #(block_size, block_size)
-    decay = tl.exp(seg_sum)
+    decay = tl.exp(seg_sum)  # checked ok
+
     scores = tl.where((offs_t[:, None] >= offs_t[None, :]),
-                      CB * decay * dt[:, None], 0.0)
+                      CB * decay * dt[None, :], 0.0)
+    tl.store(debug_block_ptrs, CB, mask=(mask_t[:, None] & mask_t[None, :]))
     # lower precision
     scores = scores.to(tl.float16)
     out_diag = tl.dot(scores, x)  # (block_size, headdim)
@@ -224,9 +237,9 @@ def fused_block_scan_v0_kernel(
     out_ptrs = output_ptr + (pid_h * stride_output_h +
                              (t_start + offs_t[:, None]) * stride_output_t +
                              offs_d[None, :] * stride_output_d)
-    # tl.store(out_ptrs, out_diag, mask=(mask_t[:, None] & mask_d[None, :]))
-    # tl.store(out_ptrs, out_off, mask=(mask_t[:, None] & mask_d[None, :]))
     tl.store(out_ptrs, out_diag, mask=(mask_t[:, None] & mask_d[None, :]))
+    # tl.store(out_ptrs, out_off, mask=(mask_t[:, None] & mask_d[None, :]))
+    # tl.store(out_ptrs, out, mask=(mask_t[:, None] & mask_d[None, :]))
 
 
 # Fused block SSD performs inter-block scan and final output activation
@@ -278,6 +291,9 @@ def fused_block_scan(
                                dtype=block_states.dtype,
                                device=device)
     output = torch.empty_like(x)
+    debug_block = torch.empty((nblocks, nheads, block_size, block_size),
+                              dtype=torch.float32,
+                              device=device)
     prev_state_strides = ((0, 0, 0, 0) if prev_states is None else
                           (prev_states.stride(0), prev_states.stride(1),
                            prev_states.stride(2), prev_states.stride(3)))
@@ -306,6 +322,7 @@ def fused_block_scan(
             prev_states_ptr=prev_states,
             final_states_ptr=final_states,
             output_ptr=output,
+            debug_block_ptr=debug_block,
             block_size=block_size,
             headdim=headdim,
             dstate=dstate,
@@ -347,9 +364,13 @@ def fused_block_scan(
             stride_output_t=output.stride(0),
             stride_output_h=output.stride(1),
             stride_output_d=output.stride(2),
+            stride_debug_block_n=debug_block.stride(0),
+            stride_debug_block_h=debug_block.stride(1),
+            stride_debug_block_k0=debug_block.stride(2),
+            stride_debug_block_k1=debug_block.stride(3),
             BLOCK_SIZE_S=max(dstate, 16),
             BLOCK_SIZE_TT=block_size_tt,
             IS_STORE_PREV_STATES=return_prev_states,
         )
 
-    return prev_states, final_states, output
+    return prev_states, final_states, output, debug_block
