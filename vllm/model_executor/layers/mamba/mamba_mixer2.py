@@ -14,6 +14,8 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
+from vllm.model_executor.layers.mamba.fused_ops import (fused_block_scan,
+                                                        fused_block_ssd)
 from vllm.model_executor.layers.mamba.mamba2_metadata import Mamba2Metadata
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn, causal_conv1d_update)
@@ -24,9 +26,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     LoaderFunction, composed_weight_loader, sharded_weight_loader)
 from vllm.model_executor.models.mamba_cache import MambaCacheParams
 from vllm.model_executor.utils import set_weight_attrs
-
-from .fused_ops.fused_block_scan import fused_block_scan
-from .fused_ops.fused_block_ssd import fused_block_ssd
 
 # Added by the IBM Team, 2024
 

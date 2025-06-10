@@ -200,7 +200,7 @@ def fused_block_scan_v0_kernel(
     scores = tl.where((offs_t[:, None] >= offs_t[None, :]),
                       CB * decay * dt[None, :], 0.0)
     # lower precision (prevents out of resource compile error on H100)
-    scores = scores.to(tl.float16)
+    scores = scores.to(x_ptr.dtype.element_ty)
     out_diag = tl.dot(scores, x)  # (block_size, headdim)
 
     # 2.2 compute off-diagonal block contributions to the output
