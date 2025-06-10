@@ -133,20 +133,33 @@ def fused_block_scan_v0_kernel(
     #    redundantly computed in thread blocks of the same sequence
     #    NOTE: this introduces load imbalance among thread blocks
     for t in range(block_start, pid_n + 1):
-        t_end = tl.load(block_cu_seqlens_ptr +
-                        (t + 1) * stride_block_cu_seqlens_n)
-        dA_cumsum_last = tl.load(dA_cumsum_ptr_h +
-                                 (t_end - 1) * stride_dA_cumsum_t)  # scalar
-        block_decay = tl.exp(dA_cumsum_last)
-
-        block_states_ptrs_t = block_states_ptrs + t * stride_block_states_n
-        state = tl.load(block_states_ptrs_t,
-                        mask=(mask_d[:, None] & mask_s[None, :]),
-                        other=0.0)
-        state += block_decay * prev_state
-
         # NOTE: store backs are distributed among blocks of the same sequence
-        if pid_n == t:  # last block
+        if (t == pid_n):  # my turn to write prev_state
+            if IS_STORE_PREV_STATES:
+                prev_states_ptrs = prev_states_ptr + (
+                    pid_h * stride_prev_states_h +
+                    offs_d[:, None] * stride_prev_states_d +
+                    offs_s[None, :] * stride_prev_states_s)
+                prev_states_ptrs_t = prev_states_ptrs + t * stride_prev_states_n
+                tl.store(prev_states_ptrs_t,
+                         prev_state,
+                         mask=(mask_d[:, None] & mask_s[None, :]))
+        # update state
+        if (t < pid_n) or (t == (block_end - 1)):
+            t_end = tl.load(block_cu_seqlens_ptr +
+                            (t + 1) * stride_block_cu_seqlens_n)
+            dA_cumsum_last = tl.load(
+                dA_cumsum_ptr_h + (t_end - 1) * stride_dA_cumsum_t)  # scalar
+            block_decay = tl.exp(dA_cumsum_last)
+
+            block_states_ptrs_t = block_states_ptrs + t * stride_block_states_n
+            state = tl.load(block_states_ptrs_t,
+                            mask=(mask_d[:, None] & mask_s[None, :]),
+                            other=0.0)
+            state += block_decay * prev_state
+            prev_state = state
+
+            # store to final state if last block in sequence
             if t == (block_end - 1):
                 final_states_ptrs = final_states_ptr + (
                     pid_b * stride_final_states_b +
@@ -156,16 +169,6 @@ def fused_block_scan_v0_kernel(
                 tl.store(final_states_ptrs,
                          state,
                          mask=(mask_d[:, None] & mask_s[None, :]))
-            elif IS_STORE_PREV_STATES:
-                prev_states_ptrs = prev_states_ptr + (
-                    pid_h * stride_prev_states_h +
-                    offs_d[:, None] * stride_prev_states_d +
-                    offs_s[None, :] * stride_prev_states_s)
-                prev_states_ptrs_t = prev_states_ptrs + t * stride_prev_states_n
-                tl.store(prev_states_ptrs_t,
-                         state,
-                         mask=(mask_d[:, None] & mask_s[None, :]))
-        prev_state = state
 
     # 2. compute output
     # start and end token index in seqlen dimension
