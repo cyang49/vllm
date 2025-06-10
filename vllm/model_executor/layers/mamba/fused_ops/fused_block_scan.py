@@ -18,9 +18,9 @@ from vllm.triton_utils import tl, triton
 #   - s: dstate
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_D': 16}),
+        # triton.Config({'BLOCK_SIZE_D': 16}),
         triton.Config({'BLOCK_SIZE_D': 32}),
-        triton.Config({'BLOCK_SIZE_D': 64}),
+        # triton.Config({'BLOCK_SIZE_D': 64}),
     ],
     key=[],
 )
@@ -51,10 +51,10 @@ def fused_block_scan_v0_kernel(
     stride_x_t: tl.constexpr,
     stride_x_h: tl.constexpr,
     stride_x_d: tl.constexpr,
+    stride_dt_h,
     stride_dt_t: tl.constexpr,
-    stride_dt_h: tl.constexpr,
+    stride_dA_cumsum_h,
     stride_dA_cumsum_t: tl.constexpr,
-    stride_dA_cumsum_h: tl.constexpr,
     stride_block_states_n: tl.constexpr,
     stride_block_states_h: tl.constexpr,
     stride_block_states_d: tl.constexpr,
@@ -69,8 +69,8 @@ def fused_block_scan_v0_kernel(
     stride_D_h: tl.constexpr,
     stride_CB_n: tl.constexpr,
     stride_CB_g: tl.constexpr,
-    stride_CB_k0: tl.constexpr,
-    stride_CB_k1: tl.constexpr,
+    stride_CB_t0: tl.constexpr,
+    stride_CB_t1: tl.constexpr,
     stride_block_cu_seqlens_n: tl.constexpr,
     stride_block_req_idx_n: tl.constexpr,
     stride_req_cu_nblocks_b: tl.constexpr,
@@ -184,7 +184,7 @@ def fused_block_scan_v0_kernel(
         (t_start + offs_t) * stride_dA_cumsum_t)  # (block_size,)
     CB_ptrs = CB_ptr + (
         pid_n * stride_CB_n + pid_g * stride_CB_g +
-        offs_t[:, None] * stride_CB_k0 + offs_t[None, :] * stride_CB_k1
+        offs_t[:, None] * stride_CB_t0 + offs_t[None, :] * stride_CB_t1
     )  # (block_size, block_size)
 
     # 2.1 compute diagonal output contribution
@@ -233,8 +233,8 @@ def fused_block_scan_v0_kernel(
 # prev_states (nblocks, nheads, headdim, dstate) # Optional for debug
 def fused_block_scan(
     x,  # (seqlen, nheads, headdim)
-    dt,  # (seqlen, nheads)
-    dA_cumsum,  # (seqlen, nheads)
+    dt,  # (nheads, seqlen)
+    dA_cumsum,  # (nheads, seqlen)
     block_states,  # (nblocks, block_size, headdim, dstate)
     initial_states,  # (batch, nheads, headdim, dstate)
     C,  # (seqlen, ngroups, dstate)
@@ -254,8 +254,10 @@ def fused_block_scan(
     nblocks = block_states.shape[0]
     batch = initial_states.shape[0]
 
-    assert dt.shape == (seqlen, nheads)
-    assert dA_cumsum.shape == (seqlen, nheads)
+    # assert dt.shape == (seqlen, nheads)
+    # assert dA_cumsum.shape == (seqlen, nheads)
+    assert dt.shape == (nheads, seqlen)
+    assert dA_cumsum.shape == (nheads, seqlen)
     assert C.shape == (seqlen, ngroups, dstate)
     assert D.shape == (nheads, )
     assert CB.shape == (nblocks, ngroups, block_size, block_size)
@@ -309,10 +311,10 @@ def fused_block_scan(
             stride_x_t=x.stride(0),
             stride_x_h=x.stride(1),
             stride_x_d=x.stride(2),
-            stride_dt_t=dt.stride(0),
-            stride_dt_h=dt.stride(1),
-            stride_dA_cumsum_t=dA_cumsum.stride(0),
-            stride_dA_cumsum_h=dA_cumsum.stride(1),
+            stride_dt_h=dt.stride(0),
+            stride_dt_t=dt.stride(1),
+            stride_dA_cumsum_h=dA_cumsum.stride(0),
+            stride_dA_cumsum_t=dA_cumsum.stride(1),
             stride_block_states_n=block_states.stride(0),
             stride_block_states_h=block_states.stride(1),
             stride_block_states_d=block_states.stride(2),
@@ -327,8 +329,8 @@ def fused_block_scan(
             stride_D_h=D.stride(0),
             stride_CB_n=CB.stride(0),
             stride_CB_g=CB.stride(1),
-            stride_CB_k0=CB.stride(2),
-            stride_CB_k1=CB.stride(3),
+            stride_CB_t0=CB.stride(2),
+            stride_CB_t1=CB.stride(3),
             stride_block_cu_seqlens_n=block_cu_seqlens.stride(0),
             stride_block_req_idx_n=block_req_idx.stride(0),
             stride_req_cu_nblocks_b=req_cu_nblocks.stride(0),

@@ -558,9 +558,9 @@ class MambaMixer2(CustomOp):
                            -1)
             C_p = C_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
                            -1)
-            dA_cumsum, block_states, CB = fused_block_ssd(
+            dA_cumsum, dt_out, block_states, CB = fused_block_ssd(
                 x=x_p,
-                dt=dt_p,  # NOTE: mutated
+                dt=dt_p,
                 A=self.A,
                 B=B_p,
                 C=C_p,
@@ -571,13 +571,12 @@ class MambaMixer2(CustomOp):
                 dt_softplus=True,
                 states_in_fp32=True,
                 FUSED_COMPUTE_CB=True,
-                block_size_kk=16,  # split along block_size dim
+                block_size_tt=16,  # split along block_size dim
             )
 
-            # NOTE: CB result looks fine
             final_states, scan_output, _ = fused_block_scan(
                 x=x_p,
-                dt=dt_p,
+                dt=dt_out,
                 dA_cumsum=dA_cumsum,
                 block_states=block_states,
                 initial_states=initial_states,
