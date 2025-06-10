@@ -224,8 +224,8 @@ def fused_block_scan_v0_kernel(
                       offs_s[None, :] * stride_C_s)  # (block_size, dstate)
     C = tl.load(C_ptrs, mask=(mask_t[:, None] & mask_s[None, :]),
                 other=0.0).to(tl.float32)
-    out_off = tl.dot(C, prev_state.T) * dA_cumsum[:,
-                                                  None]  #(block_size, headdim)
+    out_off = (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum[:, None])
+               )  #(block_size, headdim)
 
     # 2.3 sum up contributions
     out = out_diag + out_off  # (block_size, headdim)
@@ -237,9 +237,9 @@ def fused_block_scan_v0_kernel(
     out_ptrs = output_ptr + (pid_h * stride_output_h +
                              (t_start + offs_t[:, None]) * stride_output_t +
                              offs_d[None, :] * stride_output_d)
-    tl.store(out_ptrs, out_diag, mask=(mask_t[:, None] & mask_d[None, :]))
+    # tl.store(out_ptrs, out_diag, mask=(mask_t[:, None] & mask_d[None, :]))
     # tl.store(out_ptrs, out_off, mask=(mask_t[:, None] & mask_d[None, :]))
-    # tl.store(out_ptrs, out, mask=(mask_t[:, None] & mask_d[None, :]))
+    tl.store(out_ptrs, out, mask=(mask_t[:, None] & mask_d[None, :]))
 
 
 # Fused block SSD performs inter-block scan and final output activation
