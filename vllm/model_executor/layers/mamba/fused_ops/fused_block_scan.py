@@ -11,7 +11,6 @@ from vllm.triton_utils import tl, triton
 # except ImportError:
 #     from triton.language.math import fast_expf
 
-
 # Notations for readability
 #   - b: batch
 #   - h: nheads
@@ -21,16 +20,18 @@ from vllm.triton_utils import tl, triton
 #   - k: block_size
 #   - d: headdim
 #   - s: dstate
+
+
 @triton.autotune(
     configs=[
-        # triton.Config({'BLOCK_SIZE_D': 16}),
+        triton.Config({'BLOCK_SIZE_D': 16}),
         triton.Config({'BLOCK_SIZE_D': 32}),
-        # triton.Config({'BLOCK_SIZE_D': 64}),
+        triton.Config({'BLOCK_SIZE_D': 64}),
     ],
     key=[],
 )
 @triton.jit
-def fused_block_scan_v0_kernel(
+def fused_block_scan_v1_kernel(
     # Inputs
     x_ptr,
     dt_ptr,
@@ -102,6 +103,7 @@ def fused_block_scan_v0_kernel(
     pid_g = pid_h // nheads_ngroups_ratio  # group idx
 
     offs_t = tl.arange(0, block_size)
+    offs_tt = tl.arange(0, BLOCK_SIZE_TT)
     offs_d = (pid_d * BLOCK_SIZE_D) + tl.arange(0, BLOCK_SIZE_D)
     offs_s = tl.arange(0, BLOCK_SIZE_S)
 
@@ -178,58 +180,85 @@ def fused_block_scan_v0_kernel(
                 # update prev_state only if it's not the last
                 prev_state = state
 
-    # 2. compute output
-    # NOTE: prev_state tensor from the previous step is reused
-    x_ptrs = x_ptr + (pid_h * stride_x_h +
-                      (t_start + offs_t[:, None]) * stride_x_t +
-                      offs_d[None, :] * stride_x_d)  # (block_size, headdim)
-    dt_ptrs = dt_ptr + (pid_h * stride_dt_h +
-                        (t_start + offs_t) * stride_dt_t)  # (block_size,)
+    # compute base pointers
+    x_ptr += pid_h * stride_x_h
+    dt_ptr += pid_h * stride_dt_h
+    CB_ptr += pid_n * stride_CB_n + pid_g * stride_CB_g
+    C_ptr += pid_g * stride_C_g
+    output_ptr += pid_h * stride_output_h
+
+    # full block loads
+    x_ptrs = x_ptr + (
+        (t_start + offs_t)[:, None] * stride_x_t + offs_d[None, :] * stride_x_d
+    )  # (block_size, headdim)
+    dt_ptrs = dt_ptr + ((t_start + offs_t) * stride_dt_t)  # (block_size,)
     dA_cumsum_ptrs = dA_cumsum_ptr_h + (
         (t_start + offs_t) * stride_dA_cumsum_t)  # (block_size,)
-    CB_ptrs = CB_ptr + (
-        pid_n * stride_CB_n + pid_g * stride_CB_g +
-        offs_t[:, None] * stride_CB_t0 + offs_t[None, :] * stride_CB_t1
-    )  # (block_size, block_size)
 
-    # 2.1 compute diagonal output contribution
     x = tl.load(x_ptrs, mask=(mask_t[:, None] & mask_d[None, :]), other=0.0)
     dt = tl.load(dt_ptrs, mask=mask_t, other=0.0)
     dA_cumsum = tl.load(dA_cumsum_ptrs, mask=mask_t, other=0.0)
-    CB = tl.load(CB_ptrs)  # ok to not have mask - causal mask applied later
-    #, mask=(mask_t[:, None] & mask_t[None, :]), other=0.0)
-
-    seg_sum = dA_cumsum[:,
-                        None] - dA_cumsum[None, :]  #(block_size, block_size)
-    decay = tl.exp(seg_sum)
-    # decay = fast_expf(seg_sum)
-
-    scores = tl.where((offs_t[:, None] >= offs_t[None, :]),
-                      CB * decay * dt[None, :], 0.0)
-    # lower precision (prevents out of resource compile error on H100)
-    scores = scores.to(x_ptr.dtype.element_ty)
-    out_diag = tl.dot(scores, x)  # (block_size, headdim)
-
-    # 2.2 compute off-diagonal block contributions to the output
-    C_ptrs = C_ptr + (pid_g * stride_C_g +
-                      (t_start + offs_t[:, None]) * stride_C_t +
-                      offs_s[None, :] * stride_C_s)  # (block_size, dstate)
-    C = tl.load(C_ptrs, mask=(mask_t[:, None] & mask_s[None, :]),
-                other=0.0).to(tl.float32)
-    out_off = (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum[:, None])
-               )  #(block_size, headdim)
-
-    # 2.3 sum up contributions
-    out = out_diag + out_off  # (block_size, headdim)
-
-    # 2.4 optionally for D
     D = tl.load(D_ptr + pid_h * stride_D_h)
-    out += x * D
 
-    out_ptrs = output_ptr + (pid_h * stride_output_h +
-                             (t_start + offs_t[:, None]) * stride_output_t +
-                             offs_d[None, :] * stride_output_d)
-    tl.store(out_ptrs, out, mask=(mask_t[:, None] & mask_d[None, :]))
+    # NOTE: tt tiles along rows of CB, but keeping the columns full
+    #       block_size. This is important and provide significant
+    #       performance boost over v0 for full sized blocks
+    for tt in range(0, block_size, BLOCK_SIZE_TT):
+        mask_tt = offs_tt < (ntokens - tt)
+
+        # 2. compute output
+        # NOTE: prev_state tensor from the previous step is reused
+        dA_cumsum_tt_ptrs = dA_cumsum_ptr_h + (
+            (t_start + tt + offs_tt) * stride_dA_cumsum_t)  # (BLOCK_SIZE_TT,)
+
+        # NOTE: need to reload slices of x and dA_cumsum even though they were
+        #       loaded already due to lacking ways to slice tensors in triton
+        x_tt_ptrs = x_ptr + (
+            (t_start + tt + offs_tt)[:, None] * stride_x_t +
+            offs_d[None, :] * stride_x_d)  # (BLOCK_SIZE_TT, headdim)
+        dA_cumsum_tt = tl.load(dA_cumsum_tt_ptrs, mask=mask_tt, other=0.0)
+        x_tt = tl.load(x_tt_ptrs,
+                       mask=(mask_tt[:, None] & mask_d[None, :]),
+                       other=0.0)
+        CB_ptrs = CB_ptr + (
+            (tt + offs_tt)[:, None] * stride_CB_t0 +
+            offs_t[None, :] * stride_CB_t1)  # (BLOCK_SIZE_TT, block_size)
+
+        # 2.1 compute diagonal output contribution
+        CB = tl.load(
+            CB_ptrs)  # ok to not have mask - causal mask applied later
+
+        seg_sum = dA_cumsum_tt[:, None] - dA_cumsum[
+            None, :]  #(BLOCK_SIZE_TT, block_size)
+        decay = tl.exp(seg_sum)
+        # decay = fast_expf(seg_sum)
+
+        scores = tl.where(((tt + offs_tt)[:, None] >= offs_t[None, :]),
+                          CB * decay * dt[None, :], 0.0)
+        # lower precision (prevents out of resource compile error on H100)
+        scores = scores.to(x_ptr.dtype.element_ty)
+        out_diag = tl.dot(scores, x)  # (BLOCK_SIZE_TT, headdim)
+
+        # 2.2 compute off-diagonal block contributions to the output
+        C_ptrs = C_ptr + (
+            (t_start + tt + offs_tt)[:, None] * stride_C_t +
+            offs_s[None, :] * stride_C_s)  # (BLOCK_SIZE_TT, dstate)
+        C = tl.load(C_ptrs,
+                    mask=(mask_tt[:, None] & mask_s[None, :]),
+                    other=0.0).to(tl.float32)
+        out_off = (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_tt[:, None])
+                   )  #(BLOCK_SIZE_TT, headdim)
+
+        # 2.3 sum up contributions
+        out = out_diag + out_off  # (BLOCK_SIZE_TT, headdim)
+
+        # 2.4 optionally for D
+        out += x_tt * D
+
+        out_ptrs = output_ptr + (
+            (t_start + tt + offs_tt)[:, None] * stride_output_t +
+            offs_d[None, :] * stride_output_d)
+        tl.store(out_ptrs, out, mask=(mask_tt[:, None] & mask_d[None, :]))
 
 
 # Fused block SSD performs inter-block scan and final output activation
@@ -261,8 +290,6 @@ def fused_block_scan(
     nblocks = block_states.shape[0]
     batch = initial_states.shape[0]
 
-    # assert dt.shape == (seqlen, nheads)
-    # assert dA_cumsum.shape == (seqlen, nheads)
     assert dt.shape == (nheads, seqlen)
     assert dA_cumsum.shape == (nheads, seqlen)
     assert C.shape == (seqlen, ngroups, dstate)
@@ -296,7 +323,7 @@ def fused_block_scan(
                          triton.cdiv(headdim, META['BLOCK_SIZE_D']))
 
     with torch.cuda.device(x.device.index):
-        fused_block_scan_v0_kernel[grid](
+        fused_block_scan_v1_kernel[grid](
             x_ptr=x,
             dt_ptr=dt,
             dA_cumsum_ptr=dA_cumsum,
