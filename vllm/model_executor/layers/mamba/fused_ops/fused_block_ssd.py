@@ -143,21 +143,21 @@ def fused_block_ssd_v2_kernel(
     acc = tl.zeros((headdim, dstate), dtype=tl.float32)
     i = 0
     # In a for loop, process tokens within the length bound (ntokens)
-    for kk in range(0, ntokens, BLOCK_SIZE_TT):
-        mask_kk = offs_tt < (ntokens - kk)
-        x_ptr_kk = x_ptr + kk * stride_x_t
-        B_ptr_kk = B_ptr + kk * stride_B_t
+    for tt in range(0, ntokens, BLOCK_SIZE_TT):
+        mask_tt = offs_tt < (ntokens - tt)
+        x_ptr_tt = x_ptr + tt * stride_x_t
+        B_ptr_tt = B_ptr + tt * stride_B_t
 
-        x_ptrs = x_ptr_kk + offs_d[:, None] * stride_x_d + offs_tt[
-            None, :] * stride_x_t  # (headdim, BLOCK_SIZE_KK)
-        B_ptrs = B_ptr_kk + offs_tt[:, None] * stride_B_t + offs_s[
-            None, :] * stride_B_s  # (BLOCK_SIZE_KK, dstate)
+        x_ptrs = x_ptr_tt + offs_d[:, None] * stride_x_d + offs_tt[
+            None, :] * stride_x_t  # (headdim, BLOCK_SIZE_TT)
+        B_ptrs = B_ptr_tt + offs_tt[:, None] * stride_B_t + offs_s[
+            None, :] * stride_B_s  # (BLOCK_SIZE_TT, dstate)
 
         x = tl.load(x_ptrs,
-                    mask=(mask_d[:, None] & mask_kk[None, :]),
+                    mask=(mask_d[:, None] & mask_tt[None, :]),
                     other=0.0).to(tl.float32)
         B_kk = tl.load(B_ptrs,
-                       mask=(mask_kk[:, None] & mask_s[None, :]),
+                       mask=(mask_tt[:, None] & mask_s[None, :]),
                        other=0.0).to(tl.float32)
 
         # Row selection work-around with masking
