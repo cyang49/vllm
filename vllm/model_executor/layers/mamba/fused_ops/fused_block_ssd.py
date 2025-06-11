@@ -187,9 +187,9 @@ def fused_block_ssd_v2_kernel(  # 0.121 mseconds for 8 full blocks on H100
         offs_s[None, :] * stride_block_states_s
     tl.store(block_states_ptrs, acc, mask=(mask_d[:, None] & mask_s[None, :]))
 
-    # Compute CB matrix per group
     if FUSED_COMPUTE_CB:
-        if (pid_h % nheads_ngroups_ratio == 0):
+        # Compute CB matrix per group
+        if (pid_h % nheads_ngroups_ratio == 0) and (pid_d == 0):
             B_ptrs = B_ptr + offs_t[:, None] * stride_B_t + offs_s[
                 None, :] * stride_B_s  # (block_size, dstate)
             C_ptr += t_start * stride_C_t + pid_g * stride_C_g
