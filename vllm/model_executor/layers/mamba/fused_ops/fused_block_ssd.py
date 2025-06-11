@@ -10,23 +10,16 @@ from vllm.triton_utils import tl, triton
 
 @triton.autotune(
     configs=[
-        # triton.Config({'BLOCK_SIZE_TT': 16, 'BLOCK_SIZE_D': 16}),
-        # triton.Config({'BLOCK_SIZE_TT': 32, 'BLOCK_SIZE_D': 16}),
-        # triton.Config({'BLOCK_SIZE_TT': 64, 'BLOCK_SIZE_D': 16}),
-        # triton.Config({'BLOCK_SIZE_TT': 16, 'BLOCK_SIZE_D': 32}),
         triton.Config({
             'BLOCK_SIZE_TT': 32,
-            'BLOCK_SIZE_D': 32
+            'BLOCK_SIZE_D': 32,
+            'BLOCK_SIZE_SS': 32,
         }),  # best on H100
-        # triton.Config({'BLOCK_SIZE_TT': 64, 'BLOCK_SIZE_D': 32}),
-        # triton.Config({'BLOCK_SIZE_TT': 16, 'BLOCK_SIZE_D': 64}),
-        # triton.Config({'BLOCK_SIZE_TT': 32, 'BLOCK_SIZE_D': 64}),
-        # triton.Config({'BLOCK_SIZE_TT': 64, 'BLOCK_SIZE_D': 64}),
     ],
     key=[],
 )
 @triton.jit
-def fused_block_ssd_v2_kernel(  # 0.121 mseconds for 8 full blocks on H100
+def fused_block_ssd_v2_kernel(  # 0.112 mseconds for 8 full blocks on H100
     # Inputs
     x_ptr,
     dt_ptr,
@@ -80,6 +73,7 @@ def fused_block_ssd_v2_kernel(  # 0.121 mseconds for 8 full blocks on H100
     BLOCK_SIZE_TT: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_S: tl.constexpr,
+    BLOCK_SIZE_SS: tl.constexpr,
 ):
     pid_n = tl.program_id(0)  # block idx
     pid_h = tl.program_id(1)  # head idx
@@ -90,11 +84,15 @@ def fused_block_ssd_v2_kernel(  # 0.121 mseconds for 8 full blocks on H100
     offs_tt = tl.arange(0, BLOCK_SIZE_TT)
     offs_d = pid_d * BLOCK_SIZE_D + tl.arange(0, BLOCK_SIZE_D)
     offs_s = tl.arange(0, BLOCK_SIZE_S)
+    offs_ss = tl.arange(0, BLOCK_SIZE_SS)
 
     # Load block start and end offset
-    t_start = tl.load(block_cu_seqlens_ptr + pid_n * stride_block_cu_seqlens_n)
+    # NOTE: pointer arithmetic along seqlen seems to cause issues if not
+    #       explicitly cast to 64 bit?
+    t_start = tl.load(block_cu_seqlens_ptr +
+                      pid_n * stride_block_cu_seqlens_n).to(tl.int64)
     t_end = tl.load(block_cu_seqlens_ptr +
-                    (pid_n + 1) * stride_block_cu_seqlens_n)
+                    (pid_n + 1) * stride_block_cu_seqlens_n).to(tl.int64)
     ntokens = t_end - t_start
 
     # Mask out-of-bound tokens
@@ -189,219 +187,40 @@ def fused_block_ssd_v2_kernel(  # 0.121 mseconds for 8 full blocks on H100
 
     if FUSED_COMPUTE_CB:
         # Compute CB matrix per group
+        # TODO: The if condition make sure only a few triton programs will
+        # compute the submatrices. But it is possible to distribute the
+        # work and utilize more triton programs.
+        # C @ B.T is independent of prior computations and can be
+        # parallelized. It's effectively a batched matmul over
+        # (nblocks × ngroups) of square matrices (block_size × block_size).
+        # We can apply 2D output tiling to better utilize the grid and
+        # balance the workload. As a first step, we can try to distribute
+        # work of 1 group among multiple heads of that group instead of
+        # making only 1 head active
         if (pid_h % nheads_ngroups_ratio == 0) and (pid_d == 0):
-            B_ptrs = B_ptr + offs_t[:, None] * stride_B_t + offs_s[
-                None, :] * stride_B_s  # (block_size, dstate)
             C_ptr += t_start * stride_C_t + pid_g * stride_C_g
+            cb = tl.zeros((block_size, block_size), dtype=tl.float32)
+            for ss in range(0, BLOCK_SIZE_S, BLOCK_SIZE_SS):
+                mask_ss = offs_ss < (BLOCK_SIZE_S - ss)
+                # (block_size, BLOCK_SIZE_SS)
+                B_ptrs = B_ptr + (offs_t[:, None] * stride_B_t +
+                                  (ss + offs_ss)[None, :] * stride_B_s)
+                # (block_size, BLOCK_SIZE_SS)
+                C_ptrs = C_ptr + (offs_t[:, None] * stride_C_t +
+                                  (ss + offs_ss)[None, :] * stride_C_s)
+
+                C = tl.load(C_ptrs,
+                            mask=(mask_t[:, None] & mask_ss[None, :]),
+                            other=0.0)
+                B = tl.load(B_ptrs,
+                            mask=(mask_t[:, None] & mask_ss[None, :]),
+                            other=0.0)
+                cb += tl.dot(C, B.T)  # (block_size, block_size)
+
             CB_ptr += pid_n * stride_CB_n + pid_g * stride_CB_g
-            C_ptrs = C_ptr + offs_t[:, None] * stride_C_t + offs_s[
-                None, :] * stride_C_s  # (block_size, dstate)
             CB_ptrs = CB_ptr + offs_t[:, None] * stride_CB_t0 + offs_t[
                 None, :] * stride_CB_t1  # (block_size, block_size)
-            C = tl.load(C_ptrs,
-                        mask=(mask_t[:, None] & mask_s[None, :]),
-                        other=0.0)
-            B = tl.load(B_ptrs,
-                        mask=(mask_t[:, None] & mask_s[None, :]),
-                        other=0.0)
-
-            CB = tl.dot(C, B.T)  # (block_size, block_size)
-            tl.store(CB_ptrs, CB, mask=(mask_t[:, None] & mask_t[None, :]))
-
-
-# @triton.autotune(
-#     configs=[
-#         # triton.Config({'BLOCK_SIZE_TT': 16, 'BLOCK_SIZE_D': 16}),
-#         # triton.Config({'BLOCK_SIZE_TT': 32, 'BLOCK_SIZE_D': 16}),
-#         # triton.Config({'BLOCK_SIZE_TT': 64, 'BLOCK_SIZE_D': 16}),
-#         # triton.Config({'BLOCK_SIZE_TT': 16, 'BLOCK_SIZE_D': 32}),
-#         triton.Config({'BLOCK_SIZE_TT': 32, 'BLOCK_SIZE_D': 32}), # best on H100
-#         # triton.Config({'BLOCK_SIZE_TT': 64, 'BLOCK_SIZE_D': 32}),
-#         # triton.Config({'BLOCK_SIZE_TT': 16, 'BLOCK_SIZE_D': 64}),
-#         # triton.Config({'BLOCK_SIZE_TT': 32, 'BLOCK_SIZE_D': 64}),
-#         # triton.Config({'BLOCK_SIZE_TT': 64, 'BLOCK_SIZE_D': 64}),
-#     ],
-#     key=[],
-# )
-# @triton.jit
-# def fused_block_ssd_v3_kernel( # 0.142 mseconds for 8 full blocks on H100
-#     # Inputs
-#     x_ptr,
-#     dt_ptr,
-#     A_ptr,
-#     B_ptr,
-#     C_ptr,
-#     block_cu_seqlens_ptr,
-#     dt_bias_ptr,
-#     # Outputs
-#     dA_cumsum_ptr,
-#     block_states_ptr,
-#     CB_ptr,
-#     dt_out_ptr,
-#     # Matrix dimensions
-#     block_size: tl.constexpr,
-#     headdim: tl.constexpr,
-#     dstate: tl.constexpr,
-#     nheads_ngroups_ratio: tl.constexpr,
-#     # Strides
-#     stride_x_t: tl.constexpr,
-#     stride_x_h: tl.constexpr,
-#     stride_x_d: tl.constexpr,
-#     stride_dt_t: tl.constexpr,
-#     stride_dt_h: tl.constexpr,
-#     stride_A_h: tl.constexpr,
-#     stride_B_t: tl.constexpr,
-#     stride_B_g: tl.constexpr,
-#     stride_B_s: tl.constexpr,
-#     stride_C_t: tl.constexpr,
-#     stride_C_g: tl.constexpr,
-#     stride_C_s: tl.constexpr,
-#     stride_block_cu_seqlens_n: tl.constexpr,
-#     stride_dt_bias_h: tl.constexpr,
-#     stride_dA_cumsum_h,
-#     stride_dA_cumsum_t: tl.constexpr,
-#     stride_block_states_n: tl.constexpr,
-#     stride_block_states_h: tl.constexpr,
-#     stride_block_states_d: tl.constexpr,
-#     stride_block_states_s: tl.constexpr,
-#     stride_CB_n: tl.constexpr,
-#     stride_CB_g: tl.constexpr,
-#     stride_CB_t0: tl.constexpr,
-#     stride_CB_t1: tl.constexpr,
-#     stride_dt_out_h,
-#     stride_dt_out_t: tl.constexpr,
-#     # Meta-parameters
-#     HAS_DT_BIAS: tl.constexpr,
-#     USE_DT_SOFTPLUS: tl.constexpr,
-#     FUSED_COMPUTE_CB: tl.constexpr,
-#     # finer grain decomposition of block size dimension
-#     BLOCK_SIZE_TT: tl.constexpr,
-#     BLOCK_SIZE_D: tl.constexpr,
-#     BLOCK_SIZE_S: tl.constexpr,
-# ):
-#     pid_n = tl.program_id(0)  # block idx
-#     pid_h = tl.program_id(1)  # head idx
-#     pid_d = tl.program_id(2)
-#     pid_g = pid_h // nheads_ngroups_ratio  # group idx
-
-#     offs_t = tl.arange(0, block_size)
-#     offs_tt = tl.arange(0, BLOCK_SIZE_TT)
-#     offs_d = pid_d * BLOCK_SIZE_D + tl.arange(0, BLOCK_SIZE_D)
-#     offs_s = tl.arange(0, BLOCK_SIZE_S)
-
-#     # Load block start and end offset
-#     t_start = tl.load(block_cu_seqlens_ptr + pid_n * stride_block_cu_seqlens_n)
-#     t_end = tl.load(block_cu_seqlens_ptr +
-#                     (pid_n + 1) * stride_block_cu_seqlens_n)
-#     ntokens = t_end - t_start
-
-#     # Mask out-of-bound tokens
-#     mask_t = offs_t < ntokens
-#     mask_d = offs_d < headdim
-#     mask_s = offs_s < dstate
-
-#     # Compute base pointer addresses
-#     x_ptr += t_start * stride_x_t + pid_h * stride_x_h
-#     dt_ptr += t_start * stride_dt_t + pid_h * stride_dt_h
-
-#     A_ptr += pid_h * stride_A_h
-#     B_ptr += t_start * stride_B_t + pid_g * stride_B_g
-
-#     block_states_ptr += pid_n * stride_block_states_n + pid_h * stride_block_states_h
-
-#     # Output base pointers
-#     dA_cumsum_ptr += pid_h * stride_dA_cumsum_h
-#     dt_out_ptr += pid_h * stride_dt_out_h
-
-#     # Compute pointer arrays for blocks
-#     dt_ptrs = dt_ptr + offs_t * stride_dt_t
-
-#     # dt and dA_cumsum computations
-#     dt = tl.load(dt_ptrs, mask=mask_t,
-#                  other=0.0).to(tl.float32)  # (block_size,)
-#     if HAS_DT_BIAS:
-#         dt_bias_ptr += pid_h * stride_dt_bias_h
-#         dt_bias = tl.load(dt_bias_ptr)
-#         dt += dt_bias
-#     if USE_DT_SOFTPLUS:
-#         dt = softplus(dt)
-#     dt = tl.clamp(dt, min=0.0, max=float('inf'))
-
-#     # reset out of bound values
-#     dt = tl.where(mask_t, dt, 0.0)
-
-#     A = tl.load(A_ptr)
-#     dA = dt * A
-#     dA_cs = tl.cumsum(dA, axis=0)
-#     dA_cs_last = tl.sum(dA, axis=0)
-
-#     dA_cumsum_ptrs = dA_cumsum_ptr + (
-#                       (t_start + offs_t) * stride_dA_cumsum_t)
-#     tl.store(dA_cumsum_ptrs, dA_cs, mask=mask_t)
-
-#     dt_out_ptrs = dt_out_ptr + (
-#                    (t_start + offs_t) * stride_dt_out_t)
-#     tl.store(dt_out_ptrs, dt, mask=mask_t)
-
-#     # 2. Compute block states
-#     # In a for loop, process tokens within the length bound (ntokens)
-
-#     acc = tl.zeros((BLOCK_SIZE_D, BLOCK_SIZE_S), dtype=tl.float32)
-#     for tt in range(0, ntokens, BLOCK_SIZE_TT):
-#         mask_tt = offs_tt < (ntokens - tt)
-
-#         # (headdim, BLOCK_SIZE_TT)
-#         x_tt_ptrs = x_ptr + (offs_d[:, None] * stride_x_d +
-#                              (tt + offs_tt)[None, :] * stride_x_t)
-#         # (BLOCK_SIZE_TT, dstate)
-#         B_tt_ptrs = B_ptr + ((tt + offs_tt)[:, None] * stride_B_t +
-#                              offs_s[None, :] * stride_B_s)
-#         # Reload dA_cumsum and dt slice
-#         dA_cumsum_tt_ptrs = dA_cumsum_ptr + (
-#             (t_start + tt + offs_tt) * stride_dA_cumsum_t) # (BLOCK_SIZE_TT)
-#         dt_out_tt_ptrs = dt_out_ptr + (
-#             (t_start + tt + offs_tt) * stride_dt_out_t) # (BLOCK_SIZE_TT)
-
-#         x_tt = tl.load(x_tt_ptrs,
-#                     mask=(mask_d[:, None] & mask_tt[None, :]),
-#                     other=0.0).to(tl.float32)
-#         B_tt = tl.load(B_tt_ptrs,
-#                        mask=(mask_tt[:, None] & mask_s[None, :]),
-#                        other=0.0).to(tl.float32)
-#         dA_cumsum_tt = tl.load(dA_cumsum_tt_ptrs, mask=mask_tt, other=0.0)
-#         dt_tt = tl.load(dt_out_tt_ptrs, mask=mask_tt, other=0.0)
-
-#         decay_states_tt = tl.exp(dA_cs_last - dA_cumsum_tt) * dt_tt
-#         B_decay = B_tt * decay_states_tt[:, None]
-
-#         acc += tl.dot(x_tt, B_decay)
-
-#     # Store back
-#     block_states_ptrs = block_states_ptr + \
-#         offs_d[:,None] * stride_block_states_d + \
-#         offs_s[None, :] * stride_block_states_s
-#     tl.store(block_states_ptrs, acc, mask=(mask_d[:, None] & mask_s[None, :]))
-
-#     # Compute CB matrix per group
-#     if FUSED_COMPUTE_CB:
-#         if (pid_h % nheads_ngroups_ratio == 0 and pid_d == 0):
-#             B_ptrs = B_ptr + offs_t[:, None] * stride_B_t + offs_s[
-#                 None, :] * stride_B_s  # (block_size, dstate)
-#             C_ptr += t_start * stride_C_t + pid_g * stride_C_g
-#             CB_ptr += pid_n * stride_CB_n + pid_g * stride_CB_g
-#             C_ptrs = C_ptr + offs_t[:, None] * stride_C_t + offs_s[
-#                 None, :] * stride_C_s  # (block_size, dstate)
-#             CB_ptrs = CB_ptr + offs_t[:, None] * stride_CB_t0 + offs_t[
-#                 None, :] * stride_CB_t1  # (block_size, block_size)
-#             C = tl.load(C_ptrs,
-#                         mask=(mask_t[:, None] & mask_s[None, :]),
-#                         other=0.0)
-#             B = tl.load(B_ptrs,
-#                         mask=(mask_t[:, None] & mask_s[None, :]),
-#                         other=0.0)
-
-#             CB = tl.dot(C, B.T)  # (block_size, block_size)
-#             tl.store(CB_ptrs, CB, mask=(mask_t[:, None] & mask_t[None, :]))
+            tl.store(CB_ptrs, cb, mask=(mask_t[:, None] & mask_t[None, :]))
 
 
 # Fused block SSD performs intra-block computations on varlen input batch
@@ -421,7 +240,6 @@ def fused_block_ssd(
     dt_bias=None,  # (nheads, )
     dt_softplus=False,
     states_in_fp32=True,
-    block_size_tt=None,
     FUSED_COMPUTE_CB=True,
 ):
     seqlen, nheads, headdim = x.shape
@@ -457,10 +275,11 @@ def fused_block_ssd(
                       device=device) if FUSED_COMPUTE_CB else None)
     CB_strides = (0, 0, 0, 0) if CB is None else (CB.stride(0), CB.stride(1),
                                                   CB.stride(2), CB.stride(3))
+    MIN_BLOCK_SIZE = 16  # for tl.dot limitation
+    # BLOCK_SIZE_SS = 32
     # Launch grid
     grid = lambda META: (nblocks, nheads,
                          triton.cdiv(headdim, META["BLOCK_SIZE_D"]))
-
     with torch.cuda.device(x.device.index):
         # using v2 as default for now as it's slightly faster
         # still seems to underperform compared with original unfused kernels
@@ -509,9 +328,7 @@ def fused_block_ssd(
             HAS_DT_BIAS=(dt_bias is not None),
             USE_DT_SOFTPLUS=dt_softplus,
             FUSED_COMPUTE_CB=FUSED_COMPUTE_CB,
-            # BLOCK_SIZE_TT=block_size_tt,  # autotuned
-            # BLOCK_SIZE_D=BLOCK_SIZE_D,    # autotuned
-            BLOCK_SIZE_S=max(dstate, 16),
+            BLOCK_SIZE_S=max(dstate, MIN_BLOCK_SIZE),
         )
 
     return dA_cumsum, dt_out, block_states, CB
