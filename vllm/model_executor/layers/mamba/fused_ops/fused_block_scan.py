@@ -6,6 +6,11 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+# try:
+#     from triton.language.extra.cuda.libdevice import fast_expf
+# except ImportError:
+#     from triton.language.math import fast_expf
+
 
 # Notations for readability
 #   - b: batch
@@ -191,11 +196,13 @@ def fused_block_scan_v0_kernel(
     x = tl.load(x_ptrs, mask=(mask_t[:, None] & mask_d[None, :]), other=0.0)
     dt = tl.load(dt_ptrs, mask=mask_t, other=0.0)
     dA_cumsum = tl.load(dA_cumsum_ptrs, mask=mask_t, other=0.0)
-    CB = tl.load(CB_ptrs, mask=(mask_t[:, None] & mask_t[None, :]), other=0.0)
+    CB = tl.load(CB_ptrs)  # ok to not have mask - causal mask applied later
+    #, mask=(mask_t[:, None] & mask_t[None, :]), other=0.0)
 
     seg_sum = dA_cumsum[:,
                         None] - dA_cumsum[None, :]  #(block_size, block_size)
     decay = tl.exp(seg_sum)
+    # decay = fast_expf(seg_sum)
 
     scores = tl.where((offs_t[:, None] >= offs_t[None, :]),
                       CB * decay * dt[None, :], 0.0)
