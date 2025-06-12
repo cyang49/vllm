@@ -206,20 +206,6 @@ def fused_block_ssd_v2_kernel(  # 0.112 mseconds for 8 full blocks on H100
             for ss in tl.range(0, dstate, BLOCK_SIZE_SS):
                 offs_ss += ss
                 mask_ss = offs_ss < dstate
-                # # (BLOCK_SIZE_SS, block_size, )
-                # B_ptrs = B_ptr + (offs_ss[:, None] * stride_B_s +
-                #                   offs_t[None, :] * stride_B_t)
-                # # (block_size, BLOCK_SIZE_SS)
-                # C_ptrs = C_ptr + (offs_t[:, None] * stride_C_t +
-                #                     offs_ss[None, :] * stride_C_s)
-
-                # C = tl.load(C_ptrs,
-                #             mask=(mask_t[:, None] & mask_ss[None, :]),
-                #             other=0.0)
-                # B = tl.load(B_ptrs,
-                #             mask=(mask_t[None, :] & mask_ss[:, None]),
-                #             other=0.0)
-                # cb += tl.dot(C, B)  # (block_size, block_size)
 
                 # (block_size, BLOCK_SIZE_SS)
                 B_ptrs = B_ptr + (offs_t[:, None] * stride_B_t +
