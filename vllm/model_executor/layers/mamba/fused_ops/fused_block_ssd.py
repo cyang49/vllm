@@ -20,61 +20,63 @@ from vllm.triton_utils import tl, triton
 )
 @triton.jit
 def fused_block_ssd_v2_kernel(  # 0.112 mseconds for 8 full blocks on H100
-    # Inputs
-    x_ptr,
-    dt_ptr,
-    A_ptr,
-    B_ptr,
-    C_ptr,
-    block_cu_seqlens_ptr,
-    dt_bias_ptr,
-    # Outputs
-    dA_cumsum_ptr,
-    block_states_ptr,
-    CB_ptr,
-    dt_out_ptr,
-    # Matrix dimensions
-    block_size: tl.constexpr,
-    headdim: tl.constexpr,
-    dstate: tl.constexpr,
-    nheads_ngroups_ratio: tl.constexpr,
-    # Strides
-    stride_x_t: tl.constexpr,
-    stride_x_h: tl.constexpr,
-    stride_x_d: tl.constexpr,
-    stride_dt_t: tl.constexpr,
-    stride_dt_h: tl.constexpr,
-    stride_A_h: tl.constexpr,
-    stride_B_t: tl.constexpr,
-    stride_B_g: tl.constexpr,
-    stride_B_s: tl.constexpr,
-    stride_C_t: tl.constexpr,
-    stride_C_g: tl.constexpr,
-    stride_C_s: tl.constexpr,
-    stride_block_cu_seqlens_n: tl.constexpr,
-    stride_dt_bias_h: tl.constexpr,
-    stride_dA_cumsum_h,
-    stride_dA_cumsum_t: tl.constexpr,
-    stride_block_states_n: tl.constexpr,
-    stride_block_states_h: tl.constexpr,
-    stride_block_states_d: tl.constexpr,
-    stride_block_states_s: tl.constexpr,
-    stride_CB_n: tl.constexpr,
-    stride_CB_g: tl.constexpr,
-    stride_CB_t0: tl.constexpr,
-    stride_CB_t1: tl.constexpr,
-    stride_dt_out_h,
-    stride_dt_out_t: tl.constexpr,
-    # Meta-parameters
-    HAS_DT_BIAS: tl.constexpr,
-    USE_DT_SOFTPLUS: tl.constexpr,
-    FUSED_COMPUTE_CB: tl.constexpr,
-    # finer grain decomposition of block size dimension
-    BLOCK_SIZE_TT: tl.constexpr,
-    BLOCK_SIZE_D: tl.constexpr,
-    BLOCK_SIZE_S: tl.constexpr,
-    BLOCK_SIZE_SS: tl.constexpr,
+        # Inputs
+        x_ptr,
+        dt_ptr,
+        A_ptr,
+        B_ptr,
+        C_ptr,
+        block_cu_seqlens_ptr,
+        dt_bias_ptr,
+        # Outputs
+        dA_cumsum_ptr,
+        block_states_ptr,
+        CB_ptr,
+        dt_out_ptr,
+        # Matrix dimensions
+        block_size: tl.constexpr,
+        headdim: tl.constexpr,
+        dstate: tl.constexpr,
+        nheads_ngroups_ratio: tl.constexpr,
+        # Strides
+        stride_x_t: tl.constexpr,
+        stride_x_h: tl.constexpr,
+        stride_x_d: tl.constexpr,
+        stride_dt_t: tl.constexpr,
+        stride_dt_h: tl.constexpr,
+        stride_A_h: tl.constexpr,
+        stride_B_t: tl.constexpr,
+        stride_B_g: tl.constexpr,
+        stride_B_s: tl.constexpr,
+        stride_C_t: tl.constexpr,
+        stride_C_g: tl.constexpr,
+        stride_C_s: tl.constexpr,
+        stride_block_cu_seqlens_n: tl.constexpr,
+        stride_dt_bias_h: tl.constexpr,
+        stride_dA_cumsum_h,
+        stride_dA_cumsum_t: tl.constexpr,
+        stride_block_states_n: tl.constexpr,
+        stride_block_states_h: tl.constexpr,
+        stride_block_states_d: tl.constexpr,
+        stride_block_states_s: tl.constexpr,
+        stride_CB_n: tl.constexpr,
+        stride_CB_g: tl.constexpr,
+        stride_CB_t0: tl.constexpr,
+        stride_CB_t1: tl.constexpr,
+        stride_dt_out_h,
+        stride_dt_out_t: tl.constexpr,
+        # Meta-parameters
+        HAS_DT_BIAS: tl.constexpr,
+        USE_DT_SOFTPLUS: tl.constexpr,
+        FUSED_COMPUTE_CB: tl.constexpr,
+        # finer grain decomposition of block size dimension
+        BLOCK_SIZE_TT: tl.constexpr,
+        BLOCK_SIZE_D: tl.constexpr,
+        BLOCK_SIZE_S: tl.
+    constexpr,  # full dstate for xB loop, in case dstate < MIN_BLOCK_SIZE
+        BLOCK_SIZE_SS: tl.constexpr,  # for CB loop
 ):
+    tl.static_assert(dstate >= BLOCK_SIZE_SS)
     pid_n = tl.program_id(0)  # block idx
     pid_h = tl.program_id(1)  # head idx
     pid_d = tl.program_id(2)
@@ -84,15 +86,11 @@ def fused_block_ssd_v2_kernel(  # 0.112 mseconds for 8 full blocks on H100
     offs_tt = tl.arange(0, BLOCK_SIZE_TT)
     offs_d = pid_d * BLOCK_SIZE_D + tl.arange(0, BLOCK_SIZE_D)
     offs_s = tl.arange(0, BLOCK_SIZE_S)
-    offs_ss = tl.arange(0, BLOCK_SIZE_SS)
 
     # Load block start and end offset
-    # NOTE: pointer arithmetic along seqlen seems to cause issues if not
-    #       explicitly cast to 64 bit?
-    t_start = tl.load(block_cu_seqlens_ptr +
-                      pid_n * stride_block_cu_seqlens_n).to(tl.int64)
+    t_start = tl.load(block_cu_seqlens_ptr + pid_n * stride_block_cu_seqlens_n)
     t_end = tl.load(block_cu_seqlens_ptr +
-                    (pid_n + 1) * stride_block_cu_seqlens_n).to(tl.int64)
+                    (pid_n + 1) * stride_block_cu_seqlens_n)
     ntokens = t_end - t_start
 
     # Mask out-of-bound tokens
@@ -198,16 +196,33 @@ def fused_block_ssd_v2_kernel(  # 0.112 mseconds for 8 full blocks on H100
         # work of 1 group among multiple heads of that group instead of
         # making only 1 head active
         if (pid_h % nheads_ngroups_ratio == 0) and (pid_d == 0):
+            offs_ss = tl.arange(0, BLOCK_SIZE_SS)
             C_ptr += t_start * stride_C_t + pid_g * stride_C_g
             cb = tl.zeros((block_size, block_size), dtype=tl.float32)
-            for ss in range(0, BLOCK_SIZE_S, BLOCK_SIZE_SS):
-                mask_ss = offs_ss < (BLOCK_SIZE_S - ss)
+            for ss in tl.range(0, dstate, BLOCK_SIZE_SS):
+                offs_ss += ss
+                mask_ss = offs_ss < dstate
+                # # (BLOCK_SIZE_SS, block_size, )
+                # B_ptrs = B_ptr + (offs_ss[:, None] * stride_B_s +
+                #                   offs_t[None, :] * stride_B_t)
+                # # (block_size, BLOCK_SIZE_SS)
+                # C_ptrs = C_ptr + (offs_t[:, None] * stride_C_t +
+                #                     offs_ss[None, :] * stride_C_s)
+
+                # C = tl.load(C_ptrs,
+                #             mask=(mask_t[:, None] & mask_ss[None, :]),
+                #             other=0.0)
+                # B = tl.load(B_ptrs,
+                #             mask=(mask_t[None, :] & mask_ss[:, None]),
+                #             other=0.0)
+                # cb += tl.dot(C, B)  # (block_size, block_size)
+
                 # (block_size, BLOCK_SIZE_SS)
                 B_ptrs = B_ptr + (offs_t[:, None] * stride_B_t +
-                                  (ss + offs_ss)[None, :] * stride_B_s)
+                                  offs_ss[None, :] * stride_B_s)
                 # (block_size, BLOCK_SIZE_SS)
                 C_ptrs = C_ptr + (offs_t[:, None] * stride_C_t +
-                                  (ss + offs_ss)[None, :] * stride_C_s)
+                                  offs_ss[None, :] * stride_C_s)
 
                 C = tl.load(C_ptrs,
                             mask=(mask_t[:, None] & mask_ss[None, :]),
