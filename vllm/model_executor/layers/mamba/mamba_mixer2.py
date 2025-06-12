@@ -571,7 +571,6 @@ class MambaMixer2(CustomOp):
                 dt_softplus=True,
                 states_in_fp32=True,
                 FUSED_COMPUTE_CB=True,
-                block_size_tt=16,  # split along block_size dim
             )
 
             final_states, scan_output, _ = fused_block_scan(
