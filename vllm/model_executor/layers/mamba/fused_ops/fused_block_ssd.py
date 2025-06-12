@@ -72,8 +72,8 @@ def fused_block_ssd_v2_kernel(  # 0.112 mseconds for 8 full blocks on H100
         # finer grain decomposition of block size dimension
         BLOCK_SIZE_TT: tl.constexpr,
         BLOCK_SIZE_D: tl.constexpr,
-        BLOCK_SIZE_S: tl.
-    constexpr,  # full dstate for xB loop, in case dstate < MIN_BLOCK_SIZE
+        # full dstate for xB loop, in case dstate < MIN_BLOCK_SIZE
+        BLOCK_SIZE_S: tl.constexpr,
         BLOCK_SIZE_SS: tl.constexpr,  # for CB loop
 ):
     tl.static_assert(dstate >= BLOCK_SIZE_SS)
@@ -130,11 +130,15 @@ def fused_block_ssd_v2_kernel(  # 0.112 mseconds for 8 full blocks on H100
 
     dA_cumsum_ptrs = (dA_cumsum_ptr + pid_h * stride_dA_cumsum_h +
                       (t_start + offs_t) * stride_dA_cumsum_t)
-    tl.store(dA_cumsum_ptrs, dA_cs, mask=mask_t)
+    # NOTE: redundantly computed, but no need to redundantly store
+    if (pid_d == 0):
+        tl.store(dA_cumsum_ptrs, dA_cs, mask=mask_t)
 
     dt_out_ptrs = (dt_out_ptr + pid_h * stride_dt_out_h +
                    (t_start + offs_t) * stride_dt_out_t)
-    tl.store(dt_out_ptrs, dt, mask=mask_t)
+    # NOTE: redundantly computed, but no need to redundantly store
+    if (pid_d == 0):
+        tl.store(dt_out_ptrs, dt, mask=mask_t)
 
     # 2. Compute block states
 
@@ -291,8 +295,9 @@ def fused_block_ssd(
     CB_strides = (0, 0, 0, 0) if CB is None else (CB.stride(0), CB.stride(1),
                                                   CB.stride(2), CB.stride(3))
     MIN_BLOCK_SIZE = 16  # for tl.dot limitation
-    # BLOCK_SIZE_SS = 32
     # Launch grid
+    # NOTE: parallelizing along headdim result in redundant computations of
+    #       dt and dA_cumsum in thread blocks
     grid = lambda META: (nblocks, nheads,
                          triton.cdiv(headdim, META["BLOCK_SIZE_D"]))
     with torch.cuda.device(x.device.index):
