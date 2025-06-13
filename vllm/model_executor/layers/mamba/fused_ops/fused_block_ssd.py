@@ -10,11 +10,101 @@ from vllm.triton_utils import tl, triton
 
 @triton.autotune(
     configs=[
-        triton.Config({
-            'BLOCK_SIZE_TT': 32,
-            'BLOCK_SIZE_D': 32,
-            'BLOCK_SIZE_SS': 32,
-        }),  # best on H100
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 16,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=2, num_stages=3),
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 16,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=2, num_stages=4),
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 16,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=2, num_stages=5),
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 16,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=4, num_stages=3),
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 16,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=4, num_stages=4),
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 16,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=4, num_stages=5),
+
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 32,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=2, num_stages=3),
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 32,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=2, num_stages=4),
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 32,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=2, num_stages=5),
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 32,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=4, num_stages=3), # more general?
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 32,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=4, num_stages=4),
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 32,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=4, num_stages=5),
+
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 64,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=2, num_stages=3),
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 64,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=2, num_stages=4),
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 64,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=2, num_stages=5),
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 64,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=4, num_stages=3), # compute-sanitizer error
+        # triton.Config({
+        #     'BLOCK_SIZE_TT': 64,
+        #     'BLOCK_SIZE_D': 32,
+        #     'BLOCK_SIZE_SS': 32,
+        # }, num_warps=4, num_stages=4), # compute-sanitizer error
+        triton.Config(
+            {
+                'BLOCK_SIZE_TT': 64,
+                'BLOCK_SIZE_D': 32,
+                'BLOCK_SIZE_SS': 32,
+            },
+            num_warps=4,
+            num_stages=5),  #BEST
     ],
     key=[],
 )
@@ -77,9 +167,9 @@ def fused_block_ssd_v2_kernel(  # 0.112 mseconds for 8 full blocks on H100
         BLOCK_SIZE_SS: tl.constexpr,  # for CB loop
 ):
     tl.static_assert(dstate >= BLOCK_SIZE_SS)
-    pid_n = tl.program_id(0)  # block idx
-    pid_h = tl.program_id(1)  # head idx
-    pid_d = tl.program_id(2)
+    pid_d = tl.program_id(0)
+    pid_n = tl.program_id(1)  # block idx
+    pid_h = tl.program_id(2)  # head idx
     pid_g = pid_h // nheads_ngroups_ratio  # group idx
 
     offs_t = tl.arange(0, block_size)
@@ -284,8 +374,8 @@ def fused_block_ssd(
     # Launch grid
     # NOTE: parallelizing along headdim result in redundant computations of
     #       dt and dA_cumsum in thread blocks
-    grid = lambda META: (nblocks, nheads,
-                         triton.cdiv(headdim, META["BLOCK_SIZE_D"]))
+    grid = lambda META: (triton.cdiv(headdim, META["BLOCK_SIZE_D"]), nblocks,
+                         nheads)
     with torch.cuda.device(x.device.index):
         # using v2 as default for now as it's slightly faster
         # still seems to underperform compared with original unfused kernels
