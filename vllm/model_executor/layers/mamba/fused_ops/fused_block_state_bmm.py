@@ -33,12 +33,12 @@ from vllm.triton_utils import tl, triton
                 'BLOCK_SIZE_T1': 16,
             },
             num_warps=2,
-            num_stages=3),  #BEST # for 8192 146us, for 2048 74 us
+            num_stages=3),
     ],
     key=[],
 )
 @triton.jit
-def fused_block_state_bmm_kernel(  # 0.112 mseconds for 8 full blocks on H100
+def fused_block_state_bmm_kernel(
     # Inputs
     x_ptr,
     dt_ptr,
