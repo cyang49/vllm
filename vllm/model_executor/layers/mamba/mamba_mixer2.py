@@ -567,7 +567,6 @@ class MambaMixer2(CustomOp):
             #     B=B_p,
             #     C=C_p,
             #     block_size=block_size,
-            #     block_ntokens=mamba2_metadata.block_ntokens,
             #     block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
             #     dt_bias=self.dt_bias,
             #     dt_softplus=True,

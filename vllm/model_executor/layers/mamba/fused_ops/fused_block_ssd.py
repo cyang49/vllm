@@ -266,7 +266,6 @@ def fused_block_ssd(
     C,  # (seqlen, ngroups, dstate)
     block_size,
     # metadata
-    block_ntokens,  # (nblocks,)
     block_cu_seqlens,  # (nblocks+1,)
     dt_bias=None,  # (nheads, )
     dt_softplus=False,
@@ -276,7 +275,7 @@ def fused_block_ssd(
     seqlen, nheads, headdim = x.shape
     ngroups = B.shape[1]
     dstate = B.shape[-1]
-    nblocks = block_ntokens.shape[0]
+    nblocks = block_cu_seqlens.shape[0] - 1
 
     assert dt.shape == (seqlen, nheads)
     assert A.shape == (nheads, )
