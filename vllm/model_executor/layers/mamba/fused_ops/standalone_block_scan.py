@@ -6,8 +6,6 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-from .utils import generate_autotune_combinations
-
 # try:
 #     from triton.language.extra.cuda.libdevice import fast_expf
 # except ImportError:
@@ -24,29 +22,29 @@ from .utils import generate_autotune_combinations
 #   - s: dstate
 
 
-@triton.autotune(
-    configs=generate_autotune_combinations(spec={
-        'BLOCK_SIZE_D': [16, 32, 64],
-        'BLOCK_SIZE_T0': [16, 32, 64],
-        'BLOCK_SIZE_K': [16, 32, 64],
-        'num_warps': [2, 4],
-        'num_stages': [3, 4, 5],
-    }, ),
-    key=[],
-)
-# @triton.autotune(  # output calculation only
-#     configs=[
-#         triton.Config(
-#             {
-#                 'BLOCK_SIZE_D': 64,
-#                 'BLOCK_SIZE_T0': 32,
-#                 'BLOCK_SIZE_K': 64
-#             },
-#             num_warps=2,
-#             num_stages=3),
-#     ],
+# @triton.autotune(
+#     configs=generate_autotune_combinations(spec={
+#         'BLOCK_SIZE_D': [16, 32, 64],
+#         'BLOCK_SIZE_T0': [16, 32, 64],
+#         'BLOCK_SIZE_K': [16, 32, 64],
+#         'num_warps': [2, 4],
+#         'num_stages': [3, 4, 5],
+#     }, ),
 #     key=[],
 # )
+@triton.autotune(  # output calculation only
+    configs=[
+        triton.Config(
+            {
+                'BLOCK_SIZE_D': 64,
+                'BLOCK_SIZE_T0': 64,
+                'BLOCK_SIZE_K': 32,
+            },
+            num_warps=4,
+            num_stages=4),
+    ],
+    key=[],
+)
 @triton.jit
 def block_scan_kernel(
     # Inputs
@@ -102,7 +100,6 @@ def block_scan_kernel(
     pid_t0 = tl.program_id(0) % nt0blocks
 
     offs_d = (pid_d * BLOCK_SIZE_D) + tl.arange(0, BLOCK_SIZE_D)
-    # offs_s = tl.arange(0, BLOCK_SIZE_S)
 
     # Load metadata
     # start and end token index in seqlen dimension
@@ -113,7 +110,6 @@ def block_scan_kernel(
 
     # Mask out-of-bound tokens
     mask_d = offs_d < headdim
-    # mask_s = offs_s < dstate
 
     # Set base pointers
     dA_cumsum_ptr_h = dA_cumsum_ptr + pid_h * stride_dA_cumsum_h
