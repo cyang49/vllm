@@ -6,10 +6,10 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-# try:
-#     from triton.language.extra.cuda.libdevice import fast_expf
-# except ImportError:
-#     from triton.language.math import fast_expf
+try:
+    from triton.language.extra.cuda.libdevice import add_rn, fast_expf, mul_rn
+except ImportError:
+    from triton.language.math import add_rn, fast_expf, mul_rn
 
 # Notations for readability
 #   - b: batch
@@ -29,7 +29,7 @@ from vllm.triton_utils import tl, triton
 #         'BLOCK_SIZE_T0': [16, 32, 64],
 #         'BLOCK_SIZE_K': [16, 32, 64],
 #         'num_warps': [2, 4],
-#         'num_stages': [3, 4, 5],
+#         'num_stages': [1, 2, 3, 4],
 #     }, ),
 #     key=[],
 # )
@@ -42,7 +42,7 @@ from vllm.triton_utils import tl, triton
 #                 'BLOCK_SIZE_K': 64,
 #             },
 #             num_warps=4,
-#             num_stages=3),
+#             num_stages=1),
 #     ],
 #     key=[],
 # )
@@ -55,7 +55,7 @@ from vllm.triton_utils import tl, triton
                 'BLOCK_SIZE_K': 32,
             },
             num_warps=4,
-            num_stages=3),
+            num_stages=1),
     ],
     key=[],
 )
@@ -106,6 +106,7 @@ def block_scan_kernel(
     BLOCK_SIZE_S: tl.constexpr,
     BLOCK_SIZE_T0: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    USE_FAST_MATH: tl.constexpr,
 ):
     pid_n = tl.program_id(1)  # block idx
     pid_h = tl.program_id(2)  # head idx
@@ -201,45 +202,49 @@ def block_scan_kernel(
             acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0[:, None])
                     )  #(BLOCK_SIZE_T0, BLOCK_SIZE_D)
 
-    # for t1 in range(0, ntokens, BLOCK_SIZE_K):
-    for t1 in range(0, block_size, BLOCK_SIZE_K):
-        if t1 < ntokens:  # hack .. faster in practice
-            mask_t1 = k_range < (ntokens - t1)  # (BLOCK_SIZE_K,)
-            offs_t1_local = t1 + k_range
-            offs_t1_global = t_start + offs_t1_local
-            mask_t1 = offs_t1_local < ntokens
+    for t1 in range(0, ntokens, BLOCK_SIZE_K):
+        mask_t1 = k_range < (ntokens - t1)  # (BLOCK_SIZE_K,)
+        offs_t1_local = t1 + k_range
+        offs_t1_global = t_start + offs_t1_local
+        mask_t1 = offs_t1_local < ntokens
 
-            dA_cumsum_t1_ptrs = dA_cumsum_ptr_h + (
-                offs_t1_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_K,)
-            dt_t1_ptrs = dt_ptr_base + (offs_t1_global * stride_dt_t
-                                        )  # (BLOCK_SIZE_K,)
-            dt_t1 = tl.load(dt_t1_ptrs, mask=mask_t1, other=0.0)
-            dA_cumsum_t1 = tl.load(dA_cumsum_t1_ptrs, mask=mask_t1, other=0.0)
-            x_t1_ptrs = x_ptr_base + (offs_t1_global[:, None] * stride_x_t +
-                                      offs_d[None, :] * stride_x_d
-                                      )  # (BLOCK_SIZE_K, BLOCK_SIZE_D)
-            x_t1 = tl.load(x_t1_ptrs,
-                           mask=(mask_t1[:, None] & mask_d[None, :]),
-                           other=0.0)
-            CB_ptrs = CB_ptr_base + (offs_t0_local[:, None] * stride_CB_t0 +
-                                     offs_t1_local[None, :] * stride_CB_t1
-                                     )  # (BLOCK_SIZE_T0, BLOCK_SIZE_K)
+        dA_cumsum_t1_ptrs = dA_cumsum_ptr_h + (
+            offs_t1_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_K,)
+        dt_t1_ptrs = dt_ptr_base + (offs_t1_global * stride_dt_t
+                                    )  # (BLOCK_SIZE_K,)
+        dt_t1 = tl.load(dt_t1_ptrs, mask=mask_t1, other=0.0)
+        dA_cumsum_t1 = tl.load(dA_cumsum_t1_ptrs, mask=mask_t1, other=0.0)
+        x_t1_ptrs = x_ptr_base + (
+            offs_t1_global[:, None] * stride_x_t + offs_d[None, :] * stride_x_d
+        )  # (BLOCK_SIZE_K, BLOCK_SIZE_D)
+        x_t1 = tl.load(x_t1_ptrs,
+                       mask=(mask_t1[:, None] & mask_d[None, :]),
+                       other=0.0)
+        CB_ptrs = CB_ptr_base + (offs_t0_local[:, None] * stride_CB_t0 +
+                                 offs_t1_local[None, :] * stride_CB_t1
+                                 )  # (BLOCK_SIZE_T0, BLOCK_SIZE_K)
 
-            # 2.1 compute diagonal output contribution
-            # ok to not mask - causal mask applied later
-            CB = tl.load(CB_ptrs)
+        # 2.1 compute diagonal output contribution
+        # ok to not mask - causal mask applied later
+        CB = tl.load(CB_ptrs)
 
-            #(BLOCK_SIZE_T0, BLOCK_SIZE_K)
+        causal_mask = offs_t0_local[:, None] >= offs_t1_local[None, :]
+
+        #(BLOCK_SIZE_T0, BLOCK_SIZE_K)
+        # NOTE: Fast math can be faster, but it breaks software pipelining
+        if not USE_FAST_MATH:
             seg_sum = dA_cumsum_t0[:, None] - dA_cumsum_t1[None, :]
             decay = tl.exp(seg_sum)
-            # decay = fast_expf(seg_sum)
+            scores = CB * decay * dt_t1[None, :]
+        else:
+            seg_sum = add_rn(dA_cumsum_t0[:, None], -dA_cumsum_t1[None, :])
+            decay = fast_expf(seg_sum)
+            scores = mul_rn(mul_rn(CB, decay), dt_t1[None, :])
 
-            scores = tl.where(
-                (offs_t0_local[:, None] >= offs_t1_local[None, :]),
-                CB * decay * dt_t1[None, :], 0.0)
-            # lower precision (prevents out of resource compile error on H100)
-            scores = scores.to(x_ptr.dtype.element_ty)
-            acc += tl.dot(scores, x_t1)
+        scores = tl.where(causal_mask, scores, 0.0)
+        # lower precision (prevents out of resource compile error on H100)
+        scores = scores.to(x_ptr.dtype.element_ty)
+        acc += tl.dot(scores, x_t1)
 
     out_ptrs = output_ptr_base + (offs_t0_global[:, None] * stride_output_t +
                                   offs_d[None, :] * stride_output_d)
@@ -320,6 +325,7 @@ def block_scan(
             stride_output_h=output.stride(1),
             stride_output_d=output.stride(2),
             BLOCK_SIZE_S=max(dstate, 16),
+            USE_FAST_MATH=False,
         )
 
     return output

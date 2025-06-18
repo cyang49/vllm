@@ -588,7 +588,6 @@ class MambaMixer2(CustomOp):
                 B=B_p,
                 C=C_p,
                 block_size=block_size,
-                block_ntokens=mamba2_metadata.block_ntokens,
                 block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
                 states_in_fp32=True,
                 FUSED_COMPUTE_CB=True,
