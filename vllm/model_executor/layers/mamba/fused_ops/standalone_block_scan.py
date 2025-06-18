@@ -22,6 +22,7 @@ from vllm.triton_utils import tl, triton
 #   - s: dstate
 
 
+# from .utils import generate_autotune_combinations
 # @triton.autotune(
 #     configs=generate_autotune_combinations(spec={
 #         'BLOCK_SIZE_D': [16, 32, 64],
@@ -32,7 +33,20 @@ from vllm.triton_utils import tl, triton
 #     }, ),
 #     key=[],
 # )
-@triton.autotune(  # output calculation only
+# @triton.autotune(  # best for tiled dstate
+#     configs=[
+#         triton.Config(
+#             {
+#                 'BLOCK_SIZE_D': 64,
+#                 'BLOCK_SIZE_T0': 64,
+#                 'BLOCK_SIZE_K': 64,
+#             },
+#             num_warps=4,
+#             num_stages=3),
+#     ],
+#     key=[],
+# )
+@triton.autotune(  # best for non-tiled dstate
     configs=[
         triton.Config(
             {
@@ -41,7 +55,7 @@ from vllm.triton_utils import tl, triton
                 'BLOCK_SIZE_K': 32,
             },
             num_warps=4,
-            num_stages=4),
+            num_stages=3),
     ],
     key=[],
 )
@@ -95,9 +109,9 @@ def block_scan_kernel(
 ):
     pid_n = tl.program_id(1)  # block idx
     pid_h = tl.program_id(2)  # head idx
-    nt0blocks = tl.cdiv(block_size, BLOCK_SIZE_T0)
-    pid_d = tl.program_id(0) // nt0blocks
-    pid_t0 = tl.program_id(0) % nt0blocks
+    ndblocks = tl.cdiv(headdim, BLOCK_SIZE_D)
+    pid_t0 = tl.program_id(0) // ndblocks
+    pid_d = tl.program_id(0) % ndblocks
 
     offs_d = (pid_d * BLOCK_SIZE_D) + tl.arange(0, BLOCK_SIZE_D)
 
@@ -132,7 +146,7 @@ def block_scan_kernel(
     # 2. compute output
     x_t0_ptrs = x_ptr_base + (
         offs_t0_global[:, None] * stride_x_t + offs_d[None, :] * stride_x_d
-    )  # (BLOCK_SIZE_T0, headdim)
+    )  # (BLOCK_SIZE_T0, BLOCK_SIZE_D)
     x_t0 = tl.load(x_t0_ptrs,
                    mask=(mask_t0[:, None] & mask_d[None, :]),
                    other=0.0)
@@ -146,25 +160,46 @@ def block_scan_kernel(
     k_range = tl.arange(0, BLOCK_SIZE_K)
 
     # 2.2 compute off-diagonal block contributions to the output
-    for ss in range(0, dstate, BLOCK_SIZE_K):
-        offs_ss = ss + k_range
-        mask_ss = offs_ss < dstate
-
+    if (BLOCK_SIZE_S <= 128):
+        offs_s = tl.arange(0, BLOCK_SIZE_S)
+        mask_s = offs_s < dstate
         prev_states_ptrs = prev_states_ptr_base + (
             offs_d[:, None] * stride_prev_states_d +
-            offs_ss[None, :] * stride_prev_states_s)
+            offs_s[None, :] * stride_prev_states_s)
         prev_state = tl.load(prev_states_ptrs,
-                             mask=(mask_d[:, None] & mask_ss[None, :]),
-                             other=0.0)  # (BLOCK_SIZE_D, BLOCK_SIZE_K)
+                             mask=(mask_d[:, None] & mask_s[None, :]),
+                             other=0.0)  # (BLOCK_SIZE_D, BLOCK_SIZE_S)
+        prev_state = prev_state.to(C_ptr.dtype.element_ty)
 
-        C_ptrs = C_ptr_base + (offs_t0_global[:, None] * stride_C_t +
-                               offs_ss[None, :] * stride_C_s
-                               )  # (BLOCK_SIZE_T0, BLOCK_SIZE_K)
+        C_ptrs = C_ptr_base + (
+            offs_t0_global[:, None] * stride_C_t + offs_s[None, :] * stride_C_s
+        )  # (BLOCK_SIZE_T0, BLOCK_SIZE_S)
         C = tl.load(C_ptrs,
-                    mask=(mask_t0[:, None] & mask_ss[None, :]),
-                    other=0.0).to(tl.float32)
+                    mask=(mask_t0[:, None] & mask_s[None, :]),
+                    other=0.0)
         acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0[:, None])
                 )  #(BLOCK_SIZE_T0, BLOCK_SIZE_D)
+    else:
+        for ss in range(0, dstate, BLOCK_SIZE_K):
+            offs_ss = ss + k_range
+            mask_ss = offs_ss < dstate
+
+            prev_states_ptrs = prev_states_ptr_base + (
+                offs_d[:, None] * stride_prev_states_d +
+                offs_ss[None, :] * stride_prev_states_s)
+            prev_state = tl.load(prev_states_ptrs,
+                                 mask=(mask_d[:, None] & mask_ss[None, :]),
+                                 other=0.0)  # (BLOCK_SIZE_D, BLOCK_SIZE_K)
+            prev_state = prev_state.to(C_ptr.dtype.element_ty)
+
+            C_ptrs = C_ptr_base + (offs_t0_global[:, None] * stride_C_t +
+                                   offs_ss[None, :] * stride_C_s
+                                   )  # (BLOCK_SIZE_T0, BLOCK_SIZE_K)
+            C = tl.load(C_ptrs,
+                        mask=(mask_t0[:, None] & mask_ss[None, :]),
+                        other=0.0)
+            acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0[:, None])
+                    )  #(BLOCK_SIZE_T0, BLOCK_SIZE_D)
 
     for t1 in range(0, ntokens, BLOCK_SIZE_K):
         mask_t1 = k_range < (ntokens - t1)  # (BLOCK_SIZE_K,)
@@ -180,7 +215,7 @@ def block_scan_kernel(
         dA_cumsum_t1 = tl.load(dA_cumsum_t1_ptrs, mask=mask_t1, other=0.0)
         x_t1_ptrs = x_ptr_base + (
             offs_t1_global[:, None] * stride_x_t + offs_d[None, :] * stride_x_d
-        )  # (BLOCK_SIZE_K, headdim)
+        )  # (BLOCK_SIZE_K, BLOCK_SIZE_D)
         x_t1 = tl.load(x_t1_ptrs,
                        mask=(mask_t1[:, None] & mask_d[None, :]),
                        other=0.0)
@@ -239,9 +274,9 @@ def block_scan(
     output = torch.empty_like(x)
 
     # Launch grid
-    grid = lambda META: (
-        triton.cdiv(headdim, META['BLOCK_SIZE_D']) * triton.cdiv(
-            block_size, META['BLOCK_SIZE_T0']), nblocks, nheads)
+    grid = lambda META: (triton.cdiv(
+        block_size, META['BLOCK_SIZE_T0']) * triton.cdiv(
+            headdim, META['BLOCK_SIZE_D']), nblocks, nheads)
 
     with torch.cuda.device(x.device.index):
         block_scan_kernel[grid](
