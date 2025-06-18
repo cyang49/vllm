@@ -45,7 +45,7 @@ from vllm.triton_utils import tl, triton
     key=[],
 )
 @triton.jit
-def unfused_state_passing_kernel(
+def state_passing_kernel(
     # Inputs
     dA_cumsum_ptr,
     block_states_ptr,
@@ -158,7 +158,7 @@ def unfused_state_passing_kernel(
 # output:
 # final_states (batch, nheads, headdim, dstate)
 # prev_states (nblocks, nheads, headdim, dstate)
-def unfused_state_passing(
+def state_passing(
     dA_cumsum,  # (nheads, seqlen)
     block_states,  # (nblocks, block_size, headdim, dstate)
     initial_states,  # (batch, nheads, headdim, dstate)
@@ -196,7 +196,7 @@ def unfused_state_passing(
                          triton.cdiv(dstate, META['BLOCK_SIZE_S']), nheads)
 
     with torch.cuda.device(dA_cumsum.device.index):
-        unfused_state_passing_kernel[grid](
+        state_passing_kernel[grid](
             dA_cumsum_ptr=dA_cumsum,
             block_states_ptr=block_states,
             init_states_ptr=initial_states,

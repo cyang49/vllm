@@ -125,6 +125,7 @@ def fused_block_scan_v1_kernel(
     BLOCK_SIZE_T0: tl.constexpr,
     BLOCK_SIZE_T1: tl.constexpr,
     IS_STORE_PREV_STATES: tl.constexpr,
+    IF_FUSED_STATE_PASSING: tl.constexpr,
 ):
     pid_n = tl.program_id(1)  # block idx
     pid_h = tl.program_id(2)  # head idx
@@ -155,58 +156,70 @@ def fused_block_scan_v1_kernel(
         pid_h * stride_block_states_h + offs_d[:, None] * stride_block_states_d
         + offs_s[None, :] * stride_block_states_s)
     dA_cumsum_ptr_h = dA_cumsum_ptr + pid_h * stride_dA_cumsum_h
-    init_states_ptrs = init_states_ptr + (
-        pid_b * stride_init_states_b + pid_h * stride_init_states_h +
-        offs_d[:, None] * stride_init_states_d +
-        offs_s[None, :] * stride_init_states_s)
-    prev_state = tl.load(init_states_ptrs,
-                         mask=(mask_d[:, None] & mask_s[None, :]),
-                         other=0.0)
-    prev_state = prev_state.to(tl.float32)
 
-    # NOTE: Parallelize T1 makes some of these redundant
-    # 1. scan states along nblocks dimension
-    #    redundantly computed in thread blocks of the same sequence
-    #    NOTE: this introduces load imbalance among thread blocks
-    for t in range(block_start, pid_n + 1):
-        # NOTE: store backs are distributed among blocks of the same sequence
-        if (t == pid_n):  # my turn to write prev_state
-            if IS_STORE_PREV_STATES:
-                prev_states_ptrs = prev_states_ptr + (
-                    pid_h * stride_prev_states_h +
-                    offs_d[:, None] * stride_prev_states_d +
-                    offs_s[None, :] * stride_prev_states_s)
-                prev_states_ptrs_t = prev_states_ptrs + t * stride_prev_states_n
-                tl.store(prev_states_ptrs_t,
-                         prev_state,
-                         mask=(mask_d[:, None] & mask_s[None, :]))
-        # update state
-        if (t < pid_n) or (t == (block_end - 1)):
-            t_end = tl.load(block_cu_seqlens_ptr +
-                            (t + 1) * stride_block_cu_seqlens_n)
-            dA_cumsum_last = tl.load(
-                dA_cumsum_ptr_h + (t_end - 1) * stride_dA_cumsum_t)  # scalar
-            block_decay = tl.exp(dA_cumsum_last)
+    prev_state = tl.zeros((BLOCK_SIZE_D, BLOCK_SIZE_S), dtype=tl.float32)
+    if IF_FUSED_STATE_PASSING:
+        init_states_ptrs = init_states_ptr + (
+            pid_b * stride_init_states_b + pid_h * stride_init_states_h +
+            offs_d[:, None] * stride_init_states_d +
+            offs_s[None, :] * stride_init_states_s)
+        prev_state = tl.load(init_states_ptrs,
+                             mask=(mask_d[:, None] & mask_s[None, :]),
+                             other=0.0)
+        prev_state = prev_state.to(tl.float32)
 
-            block_states_ptrs_t = block_states_ptrs + t * stride_block_states_n
-            state = tl.load(block_states_ptrs_t,
-                            mask=(mask_d[:, None] & mask_s[None, :]),
-                            other=0.0)
-            state += block_decay * prev_state
+        # NOTE: Parallelize T1 makes some of these redundant
+        # 1. scan states along nblocks dimension
+        #    redundantly computed in thread blocks of the same sequence
+        #    NOTE: this introduces load imbalance among thread blocks
+        for t in range(block_start, pid_n + 1):
+            # NOTE: store backs are distributed among blocks of the same sequence
+            if (t == pid_n):  # my turn to write prev_state
+                if IS_STORE_PREV_STATES:
+                    prev_states_ptrs = prev_states_ptr + (
+                        pid_h * stride_prev_states_h +
+                        offs_d[:, None] * stride_prev_states_d +
+                        offs_s[None, :] * stride_prev_states_s)
+                    prev_states_ptrs_t = prev_states_ptrs + t * stride_prev_states_n
+                    tl.store(prev_states_ptrs_t,
+                             prev_state,
+                             mask=(mask_d[:, None] & mask_s[None, :]))
+            # update state
+            if (t < pid_n) or (t == (block_end - 1)):
+                t_end = tl.load(block_cu_seqlens_ptr +
+                                (t + 1) * stride_block_cu_seqlens_n)
+                dA_cumsum_last = tl.load(
+                    dA_cumsum_ptr_h +
+                    (t_end - 1) * stride_dA_cumsum_t)  # scalar
+                block_decay = tl.exp(dA_cumsum_last)
 
-            # store to final state if last block in sequence
-            if t == (block_end - 1):
-                final_states_ptrs = final_states_ptr + (
-                    pid_b * stride_final_states_b +
-                    pid_h * stride_final_states_h +
-                    offs_d[:, None] * stride_final_states_d +
-                    offs_s[None, :] * stride_final_states_s)
-                tl.store(final_states_ptrs,
-                         state,
-                         mask=(mask_d[:, None] & mask_s[None, :]))
-            elif (t < pid_n):
-                # update prev_state only if it's not the last
-                prev_state = state
+                block_states_ptrs_t = block_states_ptrs + t * stride_block_states_n
+                state = tl.load(block_states_ptrs_t,
+                                mask=(mask_d[:, None] & mask_s[None, :]),
+                                other=0.0)
+                state += block_decay * prev_state
+
+                # store to final state if last block in sequence
+                if t == (block_end - 1):
+                    final_states_ptrs = final_states_ptr + (
+                        pid_b * stride_final_states_b +
+                        pid_h * stride_final_states_h +
+                        offs_d[:, None] * stride_final_states_d +
+                        offs_s[None, :] * stride_final_states_s)
+                    tl.store(final_states_ptrs,
+                             state,
+                             mask=(mask_d[:, None] & mask_s[None, :]))
+                elif (t < pid_n):
+                    # update prev_state only if it's not the last
+                    prev_state = state
+    else:
+        prev_states_ptrs = prev_states_ptr + (
+            pid_n * stride_prev_states_n + pid_h * stride_prev_states_h +
+            offs_d[:, None] * stride_prev_states_d +
+            offs_s[None, :] * stride_prev_states_s)
+        prev_state = tl.load(prev_states_ptrs,
+                             mask=(mask_d[:, None] & mask_s[None, :]),
+                             other=0.0)
     # DEBUG
     # prev_state = tl.zeros((BLOCK_SIZE_D, BLOCK_SIZE_S), dtype=tl.float32)
 
@@ -311,6 +324,7 @@ def fused_block_scan(
     block_req_idx,  # (nblocks, )
     req_cu_nblocks,  # (batch+1, )
     return_prev_states=False,
+    fused_state_passing=False,
 ):
     seqlen, nheads, headdim = x.shape
     ngroups = C.shape[1]
@@ -333,8 +347,8 @@ def fused_block_scan(
     device = x.device
 
     # Allocate outputs
-    prev_states = (torch.empty_like(block_states)
-                   if return_prev_states else None)
+    prev_states = (torch.empty_like(block_states) if return_prev_states else
+                   None) if fused_state_passing else block_states
     final_states = torch.empty((batch, nheads, headdim, dstate),
                                dtype=block_states.dtype,
                                device=device)
@@ -414,6 +428,7 @@ def fused_block_scan(
             stride_output_d=output.stride(2),
             BLOCK_SIZE_S=max(dstate, 16),
             IS_STORE_PREV_STATES=return_prev_states,
+            IF_FUSED_STATE_PASSING=fused_state_passing,
         )
 
     return final_states, output, prev_states
