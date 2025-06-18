@@ -242,7 +242,6 @@ def fused_block_state_bmm(
     C,  # (seqlen, ngroups, dstate)
     block_size,
     # metadata
-    block_ntokens,  # (nblocks,)
     block_cu_seqlens,  # (nblocks+1,)
     states_in_fp32=True,
     FUSED_COMPUTE_CB=True,
@@ -250,13 +249,12 @@ def fused_block_state_bmm(
     seqlen, nheads, headdim = x.shape
     ngroups = B.shape[1]
     dstate = B.shape[-1]
-    nblocks = block_ntokens.shape[0]
+    nblocks = block_cu_seqlens.shape[0] - 1
 
     assert dt.shape == (nheads, seqlen)
     assert dA_cumsum.shape == (nheads, seqlen)
     assert C.shape == (seqlen, ngroups, dstate)
     assert C.shape == B.shape
-    assert block_cu_seqlens.shape == (nblocks + 1, )
 
     device = x.device
     dtype = x.dtype
@@ -277,8 +275,6 @@ def fused_block_state_bmm(
     CB_strides = (0, 0, 0, 0) if CB is None else (CB.stride(0), CB.stride(1),
                                                   CB.stride(2), CB.stride(3))
     # Launch grid
-    # NOTE: parallelizing along headdim result in redundant computations of
-    #       dt and dA_cumsum in thread blocks
     grid = lambda META: (triton.cdiv(headdim, META["BLOCK_SIZE_D"]) * triton.
                          cdiv(dstate, META["BLOCK_SIZE_S"]), nblocks, nheads)
     with torch.cuda.device(x.device.index):

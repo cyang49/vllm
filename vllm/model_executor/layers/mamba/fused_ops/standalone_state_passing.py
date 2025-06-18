@@ -169,8 +169,8 @@ def state_passing(
     return_prev_states=True,
 ):
 
-    nheads, seqlen = dA_cumsum.shape
-    nblocks, block_size, headdim, dstate = block_states.shape
+    nheads, _ = dA_cumsum.shape
+    nblocks, _, headdim, dstate = block_states.shape
     batch = initial_states.shape[0]
 
     # assert block_states.shape == (nblocks, nheads, headdim, dstate)

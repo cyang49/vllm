@@ -116,7 +116,6 @@ def block_cumsum(
 
     assert dt.shape == (seqlen, nheads)
     assert A.shape == (nheads, )
-    assert block_cu_seqlens.shape == (nblocks + 1, )
 
     device = dt.device
     # dtype = dt.dtype
