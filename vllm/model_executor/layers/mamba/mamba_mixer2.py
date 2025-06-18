@@ -14,10 +14,8 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
-from vllm.model_executor.layers.mamba.fused_ops import (block_cumsum,
-                                                        fused_block_scan,
-                                                        fused_block_state_bmm,
-                                                        state_passing)
+from vllm.model_executor.layers.mamba.fused_ops import (  # fused_block_scan,
+    block_cumsum, block_scan, fused_block_state_bmm, state_passing)
 from vllm.model_executor.layers.mamba.mamba2_metadata import Mamba2Metadata
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn, causal_conv1d_update)
@@ -606,20 +604,35 @@ class MambaMixer2(CustomOp):
                 return_prev_states=True,
             )
 
-            _, scan_output, _ = fused_block_scan(
+            # _, scan_output, _ = fused_block_scan(
+            #     x=x_p,
+            #     dt=dt_out,
+            #     dA_cumsum=dA_cumsum,
+            #     block_states=prev_states,
+            #     initial_states=initial_states,
+            #     C=C_p,
+            #     D=self.D,
+            #     CB=CB,
+            #     block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+            #     block_req_idx=mamba2_metadata.block_req_idx,
+            #     req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
+            #     return_prev_states=False,
+            #     fused_state_passing=False,
+            # )
+            scan_output = block_scan(
                 x=x_p,
                 dt=dt_out,
                 dA_cumsum=dA_cumsum,
-                block_states=prev_states,
-                initial_states=initial_states,
+                prev_states=prev_states,
+                # initial_states=initial_states,
                 C=C_p,
                 D=self.D,
                 CB=CB,
                 block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
-                block_req_idx=mamba2_metadata.block_req_idx,
-                req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
-                return_prev_states=False,
-                fused_state_passing=False,
+                # block_req_idx=mamba2_metadata.block_req_idx,
+                # req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
+                # return_prev_states=False,
+                # fused_state_passing=False,
             )
             varlen_states = final_states.to(torch.float16)
 
