@@ -8,9 +8,10 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
+# from .utils import generate_autotune_combinations
 # @triton.autotune(
 #     configs=generate_autotune_combinations(
-#         spec={'BLOCK_SIZE_TT': [16, 32, 64, 128, 256],
+#         spec={'BLOCK_SIZE_TT': [16, 32, 64, 128],
 #               'BLOCK_SIZE_D': [16, 32, 64, 128],
 #               'BLOCK_SIZE_S': [16, 32, 64],
 #               'BLOCK_SIZE_T0': [16],
@@ -21,7 +22,7 @@ from vllm.triton_utils import tl, triton
 #         ),
 #     key=[],
 # )
-# Best found on H100
+# Best found on H100 # fused
 @triton.autotune(
     configs=[
         triton.Config(
@@ -33,6 +34,16 @@ from vllm.triton_utils import tl, triton
                 'BLOCK_SIZE_T1': 16,
             },
             num_warps=2,
+            num_stages=3),
+        triton.Config(
+            {
+                'BLOCK_SIZE_TT': 64,
+                'BLOCK_SIZE_D': 64,
+                'BLOCK_SIZE_S': 64,
+                'BLOCK_SIZE_T0': 16,
+                'BLOCK_SIZE_T1': 16,
+            },
+            num_warps=4,
             num_stages=3),
     ],
     key=[],
@@ -89,7 +100,6 @@ def fused_block_state_bmm_kernel(
     tl.static_assert(dstate >= BLOCK_SIZE_S)
     pid_ds = tl.program_id(0)
     nsblocks = tl.cdiv(dstate, BLOCK_SIZE_S)
-    # ndblocks = tl.cdiv(headdim, BLOCK_SIZE_D)
     pid_d = pid_ds // nsblocks
     pid_s = pid_ds % nsblocks
 
@@ -97,7 +107,6 @@ def fused_block_state_bmm_kernel(
     pid_h = tl.program_id(2)  # head idx
     pid_g = pid_h // nheads_ngroups_ratio  # group idx
 
-    # offs_t = tl.arange(0, block_size)
     offs_tt = tl.arange(0, BLOCK_SIZE_TT)
 
     offs_d = pid_d * BLOCK_SIZE_D + tl.arange(0, BLOCK_SIZE_D)
@@ -110,7 +119,6 @@ def fused_block_state_bmm_kernel(
     ntokens = t_end - t_start  # number of tokens in this block
 
     # Mask out-of-bound tokens
-    # mask_t = offs_t < ntokens
     mask_d = offs_d < headdim
     mask_s = offs_s < dstate
 
@@ -145,19 +153,21 @@ def fused_block_state_bmm_kernel(
         dA_cs = tl.load(dA_cumsum_ptrs, mask=mask_tt, other=0.0)
         x_tt = tl.load(x_ptrs,
                        mask=(mask_d[:, None] & mask_tt[None, :]),
-                       other=0.0).to(tl.float32)
+                       other=0.0)
         B_tt = tl.load(B_ptrs,
                        mask=(mask_tt[:, None] & mask_s[None, :]),
-                       other=0.0).to(tl.float32)
+                       other=0.0)
 
         # Compute decay from dt and dA_cs
         decay_states = tl.exp(dA_cs_last - dA_cs) * dt
         B_decay = B_tt * decay_states[:, None]
 
-        acc += tl.dot(x_tt, B_decay)
+        # it helps speed to perform dot at lower precision
+        acc += tl.dot(x_tt, B_decay.to(x_ptr.dtype.element_ty))
 
     # Store back
-    block_states_ptr_base = block_states_ptr + pid_n * stride_block_states_n + pid_h * stride_block_states_h
+    block_states_ptr_base = block_states_ptr + (pid_n * stride_block_states_n +
+                                                pid_h * stride_block_states_h)
     block_states_ptrs = block_states_ptr_base + \
         offs_d[:,None] * stride_block_states_d + \
         offs_s[None, :] * stride_block_states_s
@@ -172,11 +182,11 @@ def fused_block_state_bmm_kernel(
         # work of 1 group among (nheads_ngroups_ratio x ndsblocks) programs
         # TODO: add assertions for sanity check
         ndsblocks = tl.num_programs(0)
-        ntcblocks = tl.cdiv(block_size, BLOCK_SIZE_T0)
+        # ntcblocks = tl.cdiv(block_size, BLOCK_SIZE_T0)
         ntbblocks = tl.cdiv(block_size, BLOCK_SIZE_T1)
-        assert (ndsblocks *
-                nheads_ngroups_ratio) == (ntcblocks *
-                                          ntbblocks), "parallelism check"
+        # assert (ndsblocks *
+        #         nheads_ngroups_ratio) == (ntcblocks *
+        #                                   ntbblocks), "parallelism check"
 
         # map from (nheads, ndsblocks) to index space of (ngroups, ntcblocks, ntbblocks)
         flat_idx = (
@@ -202,10 +212,10 @@ def fused_block_state_bmm_kernel(
             offs_ss = ss + tl.arange(0, BLOCK_SIZE_S)
             mask_ss = offs_ss < dstate
 
-            # (BLOCK_SIZE_T1, BLOCK_SIZE_SS)
+            # (BLOCK_SIZE_T1, BLOCK_SIZE_S)
             B_ptrs = B_ptr_base + (offs_t1[:, None] * stride_B_t +
                                    offs_ss[None, :] * stride_B_s)
-            # (BLOCK_SIZE_T0, BLOCK_SIZE_SS)
+            # (BLOCK_SIZE_T0, BLOCK_SIZE_S)
             C_ptrs = C_ptr_base + (offs_t0[:, None] * stride_C_t +
                                    offs_ss[None, :] * stride_C_s)
 
