@@ -22,12 +22,14 @@ except ImportError:
 #   - s: dstate
 
 
+#
 # from .utils import generate_autotune_combinations
 # @triton.autotune(
 #     configs=generate_autotune_combinations(spec={
 #         'BLOCK_SIZE_D': [16, 32, 64],
 #         'BLOCK_SIZE_T0': [16, 32, 64],
 #         'BLOCK_SIZE_K': [16, 32, 64],
+#         'USE_FAST_MATH': [True, False],
 #         'num_warps': [2, 4],
 #         'num_stages': [1, 2, 3, 4],
 #     }, ),
@@ -53,9 +55,10 @@ except ImportError:
                 'BLOCK_SIZE_D': 64,
                 'BLOCK_SIZE_T0': 64,
                 'BLOCK_SIZE_K': 32,
+                'USE_FAST_MATH': True,
             },
             num_warps=4,
-            num_stages=1),
+            num_stages=1),  # effectively turns off sw pipelining
     ],
     key=[],
 )
@@ -73,7 +76,6 @@ def block_scan_kernel(
     # Outputs
     output_ptr,
     # Matrix dimensions
-    block_size: tl.constexpr,
     headdim: tl.constexpr,
     dstate: tl.constexpr,
     nheads_ngroups_ratio: tl.constexpr,
@@ -231,7 +233,7 @@ def block_scan_kernel(
         causal_mask = offs_t0_local[:, None] >= offs_t1_local[None, :]
 
         #(BLOCK_SIZE_T0, BLOCK_SIZE_K)
-        # NOTE: Fast math can be faster, but it breaks software pipelining
+        # NOTE: Fast math can be faster but it's not portable
         if not USE_FAST_MATH:
             seg_sum = dA_cumsum_t0[:, None] - dA_cumsum_t1[None, :]
             decay = tl.exp(seg_sum)
@@ -297,7 +299,6 @@ def block_scan(
             block_cu_seqlens_ptr=block_cu_seqlens,
             prev_states_ptr=prev_states,
             output_ptr=output,
-            block_size=block_size,
             headdim=headdim,
             dstate=dstate,
             nheads_ngroups_ratio=nheads // ngroups,
@@ -325,7 +326,6 @@ def block_scan(
             stride_output_h=output.stride(1),
             stride_output_d=output.stride(2),
             BLOCK_SIZE_S=max(dstate, 16),
-            USE_FAST_MATH=False,
         )
 
     return output

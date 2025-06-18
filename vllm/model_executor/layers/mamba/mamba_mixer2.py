@@ -623,15 +623,10 @@ class MambaMixer2(CustomOp):
                 dt=dt_out,
                 dA_cumsum=dA_cumsum,
                 prev_states=prev_states,
-                # initial_states=initial_states,
                 C=C_p,
                 D=self.D,
                 CB=CB,
                 block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
-                # block_req_idx=mamba2_metadata.block_req_idx,
-                # req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
-                # return_prev_states=False,
-                # fused_state_passing=False,
             )
             varlen_states = final_states.to(torch.float16)
 
