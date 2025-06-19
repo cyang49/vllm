@@ -11,13 +11,13 @@ from vllm.triton_utils import tl, triton
 # from .utils import generate_autotune_combinations
 # @triton.autotune(
 #     configs=generate_autotune_combinations(
-#         spec={'BLOCK_SIZE_TT': [16, 32, 64, 128],
-#               'BLOCK_SIZE_D': [16, 32, 64, 128],
-#               'BLOCK_SIZE_S': [16, 32, 64],
+#         spec={'BLOCK_SIZE_TT': [32, 64, 128],
+#               'BLOCK_SIZE_D': [32, 64, 128],
+#               'BLOCK_SIZE_S': [32, 64],
 #               'BLOCK_SIZE_T0': [16],
 #               'BLOCK_SIZE_T1': [16],
 #               'num_warps': [2, 4],
-#               'num_stages': [3, 4, 5],
+#               'num_stages': [1, 2, 3, 4, 5],
 #              },
 #         ),
 #     key=[],

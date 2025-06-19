@@ -7,20 +7,43 @@ import torch
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import softplus
 from vllm.triton_utils import tl, triton
 
+# Notations for readability
+#   - b: batch
+#   - h: nheads
+#   - g: ngroups
+#   - n: nblocks
+#   - t: seqlen
+#   - k: block_size
+#   - d: headdim
+#   - s: dstate
 
+
+# from .utils import generate_autotune_combinations
+# @triton.autotune(
+#     configs=generate_autotune_combinations(
+#         spec={'BLOCK_SIZE_TT': [32, 64, 128],
+#               'BLOCK_SIZE_D': [32, 64, 128],
+#               'BLOCK_SIZE_SS': [32, 64],
+#               'BLOCK_SIZE_T0': [16],
+#               'BLOCK_SIZE_T1': [16],
+#               'num_warps': [2, 4],
+#               'num_stages': [1, 2, 3, 4, 5],
+#              },
+#         ),
+#     key=[],
+# )
 @triton.autotune(
     configs=[
-        # FIXME: need to generalize for different models
         triton.Config(
             {
-                'BLOCK_SIZE_TT': 64,
-                'BLOCK_SIZE_D': 32,
+                'BLOCK_SIZE_TT': 32,
+                'BLOCK_SIZE_D': 64,
                 'BLOCK_SIZE_SS': 32,
                 'BLOCK_SIZE_T0': 16,
                 'BLOCK_SIZE_T1': 16,
             },
-            num_warps=4,
-            num_stages=5),  #BEST
+            num_warps=2,
+            num_stages=3),  # BEST H100 2k, 8k full
     ],
     key=[],
 )

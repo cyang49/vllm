@@ -3,7 +3,6 @@
 # ruff: noqa: E501,SIM102,SIM113
 
 import torch
-from einops import rearrange
 
 from vllm.triton_utils import tl, triton
 
@@ -26,23 +25,13 @@ from vllm.triton_utils import tl, triton
 # from .utils import generate_autotune_combinations
 # @triton.autotune(
 #     configs=generate_autotune_combinations(
-#         spec={'BLOCK_SIZE_D': [16, 32, 64],
-#               'BLOCK_SIZE_T0': [16, 32, 64],
-#               'BLOCK_SIZE_T1': [16, 32, 64],
+#         spec={'BLOCK_SIZE_D': [32, 64],
+#               'BLOCK_SIZE_T0': [32, 64],
+#               'BLOCK_SIZE_T1': [32, 64],
 #               'num_warps': [2, 4],
-#               'num_stages': [3, 4, 5],
+#               'num_stages': [1, 2, 3, 4, 5],
 #              },
 #         ),
-#     key=[],
-# )
-# @triton.autotune( # everything included
-#     configs=[
-#         triton.Config({'BLOCK_SIZE_D': 64,
-#                        'BLOCK_SIZE_T0': 64,
-#                        'BLOCK_SIZE_T1': 64},
-#                       num_warps=4,
-#                       num_stages=3),
-#     ],
 #     key=[],
 # )
 @triton.autotune(  # output calculation only
@@ -53,8 +42,8 @@ from vllm.triton_utils import tl, triton
                 'BLOCK_SIZE_T0': 64,
                 'BLOCK_SIZE_T1': 64
             },
-            num_warps=2,
-            num_stages=3),
+            num_warps=4,
+            num_stages=1),  # BEST H100 2k, 8k full
     ],
     key=[],
 )
@@ -366,9 +355,6 @@ def fused_block_scan(
         triton.cdiv(headdim, META['BLOCK_SIZE_D']) * triton.cdiv(
             block_size, META['BLOCK_SIZE_T0']), nblocks, nheads)
 
-    x = rearrange(x, 't h d -> h t d')
-    C = rearrange(C, 't g s -> g t s')
-
     with torch.cuda.device(x.device.index):
         fused_block_scan_v1_kernel[grid](
             x_ptr=x,
@@ -389,8 +375,8 @@ def fused_block_scan(
             headdim=headdim,
             dstate=dstate,
             nheads_ngroups_ratio=nheads // ngroups,
-            stride_x_t=x.stride(1),
-            stride_x_h=x.stride(0),
+            stride_x_t=x.stride(0),
+            stride_x_h=x.stride(1),
             stride_x_d=x.stride(2),
             stride_dt_h=dt.stride(0),
             stride_dt_t=dt.stride(1),
@@ -404,8 +390,8 @@ def fused_block_scan(
             stride_init_states_h=initial_states.stride(1),
             stride_init_states_d=initial_states.stride(2),
             stride_init_states_s=initial_states.stride(3),
-            stride_C_t=C.stride(1),
-            stride_C_g=C.stride(0),
+            stride_C_t=C.stride(0),
+            stride_C_g=C.stride(1),
             stride_C_s=C.stride(2),
             stride_D_h=D.stride(0),
             stride_CB_n=CB.stride(0),
