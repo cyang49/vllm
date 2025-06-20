@@ -572,15 +572,40 @@ class MambaMixer2(CustomOp):
             #     FUSED_COMPUTE_CB=False,
             # )
 
+            align_blocks = True
+
             dA_cumsum, dt_out = block_cumsum(
                 dt=dt_p,
                 A=self.A,
                 block_size=block_size,
                 block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                block_ntokens=mamba2_metadata.block_ntokens,
                 dt_bias=self.dt_bias,
                 dt_softplus=True,
+                align_blocks=align_blocks,
+                block_packed_cu_seqlens=mamba2_metadata.
+                block_packed_cu_seqlens,
+                packed_seqlen=mamba2_metadata.packed_seqlen,
             )
 
+            def restore_packed(x, block_cu_seqlens, block_ntokens):
+                out = []
+                xT = x.T
+                for s, ntokens in zip(block_cu_seqlens[:-1], block_ntokens):
+                    out.append(xT[s:(s + ntokens)])
+                return torch.vstack(out).T
+
+            # print(f"{mamba2_metadata.packed_seqlen=}")
+            # print(f"before {dA_cumsum[-1]=}, {dA_cumsum.shape=}")
+            dA_cumsum = restore_packed(dA_cumsum,
+                                       mamba2_metadata.block_packed_cu_seqlens,
+                                       mamba2_metadata.block_ntokens)
+            dt_out = restore_packed(dt_out,
+                                    mamba2_metadata.block_packed_cu_seqlens,
+                                    mamba2_metadata.block_ntokens)
+            # print(f"{dA_cumsum[-1]=}, {dA_cumsum.shape=}")
+
+            align_blocks = False
             block_states, CB = fused_block_state_bmm(
                 x=x_p,
                 dt=dt_out,
@@ -591,6 +616,7 @@ class MambaMixer2(CustomOp):
                 block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
                 states_in_fp32=True,
                 FUSED_COMPUTE_CB=True,
+                align_blocks=align_blocks,
             )
 
             final_states, prev_states = state_passing(
@@ -601,6 +627,7 @@ class MambaMixer2(CustomOp):
                 block_req_idx=mamba2_metadata.block_req_idx,
                 req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
                 return_prev_states=True,
+                align_blocks=align_blocks,
             )
 
             # _, scan_output, _ = fused_block_scan(
@@ -627,6 +654,7 @@ class MambaMixer2(CustomOp):
                 D=self.D,
                 CB=CB,
                 block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                align_blocks=align_blocks,
             )
             varlen_states = final_states.to(torch.float16)
 

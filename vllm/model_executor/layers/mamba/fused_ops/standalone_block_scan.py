@@ -11,6 +11,8 @@ try:
 except ImportError:
     from triton.language.math import add_rn, fast_expf, mul_rn
 
+from .standalone_block_cumsum import align
+
 # Notations for readability
 #   - b: batch
 #   - h: nheads
@@ -109,6 +111,7 @@ def block_scan_kernel(
     BLOCK_SIZE_T0: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     USE_FAST_MATH: tl.constexpr,
+    ALIGN_BLOCKS: tl.constexpr,
 ):
     pid_n = tl.program_id(1)  # block idx
     pid_h = tl.program_id(2)  # head idx
@@ -124,6 +127,7 @@ def block_scan_kernel(
     t_end = tl.load(block_cu_seqlens_ptr +
                     (pid_n + 1) * stride_block_cu_seqlens_n)
     ntokens = t_end - t_start
+    align_t_start = align(t_start, 4) if ALIGN_BLOCKS else t_start
 
     # Mask out-of-bound tokens
     mask_d = offs_d < headdim
@@ -136,6 +140,7 @@ def block_scan_kernel(
     t0 = pid_t0 * BLOCK_SIZE_T0
     offs_t0_local = t0 + t0_range
     offs_t0_global = t_start + offs_t0_local
+    aligned_t0_global = align_t_start + offs_t0_local
     mask_t0 = offs_t0_local < ntokens
 
     # compute base pointers
@@ -156,8 +161,8 @@ def block_scan_kernel(
     D = tl.load(D_ptr + pid_h * stride_D_h)
     acc = (x_t0 * D).to(tl.float32)
 
-    dA_cumsum_t0_ptrs = dA_cumsum_ptr_h + (offs_t0_global * stride_dA_cumsum_t
-                                           )  # (BLOCK_SIZE_T0,)
+    dA_cumsum_t0_ptrs = dA_cumsum_ptr_h + (
+        aligned_t0_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_T0,)
     dA_cumsum_t0 = tl.load(dA_cumsum_t0_ptrs, mask=mask_t0, other=0.0)
 
     k_range = tl.arange(0, BLOCK_SIZE_K)
@@ -208,11 +213,12 @@ def block_scan_kernel(
         mask_t1 = k_range < (ntokens - t1)  # (BLOCK_SIZE_K,)
         offs_t1_local = t1 + k_range
         offs_t1_global = t_start + offs_t1_local
+        aligned_t1_global = align_t_start + offs_t1_local
         mask_t1 = offs_t1_local < ntokens
 
         dA_cumsum_t1_ptrs = dA_cumsum_ptr_h + (
-            offs_t1_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_K,)
-        dt_t1_ptrs = dt_ptr_base + (offs_t1_global * stride_dt_t
+            aligned_t1_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_K,)
+        dt_t1_ptrs = dt_ptr_base + (aligned_t1_global * stride_dt_t
                                     )  # (BLOCK_SIZE_K,)
         dt_t1 = tl.load(dt_t1_ptrs, mask=mask_t1, other=0.0)
         dA_cumsum_t1 = tl.load(dA_cumsum_t1_ptrs, mask=mask_t1, other=0.0)
@@ -256,15 +262,16 @@ def block_scan_kernel(
 # output:
 # output (seqlen, nheads, headdim)
 def block_scan(
-        x,  # (seqlen, nheads, headdim)
-        dt,  # (nheads, seqlen)
-        dA_cumsum,  # (nheads, seqlen)
-        prev_states,  # (nblocks, block_size, headdim, dstate)
-        C,  # (seqlen, ngroups, dstate)
-        D,
-        CB,  # (nblocks, ngroups, block_size, block_size)
-        # metadata
+    x,  # (seqlen, nheads, headdim)
+    dt,  # (nheads, seqlen)
+    dA_cumsum,  # (nheads, seqlen)
+    prev_states,  # (nblocks, block_size, headdim, dstate)
+    C,  # (seqlen, ngroups, dstate)
+    D,
+    CB,  # (nblocks, ngroups, block_size, block_size)
+    # metadata
     block_cu_seqlens,  # (nblocks+1,)
+    align_blocks=False,
 ):
     seqlen, nheads, headdim = x.shape
     ngroups = C.shape[1]
@@ -272,8 +279,10 @@ def block_scan(
     block_size = CB.shape[-1]
     nblocks = prev_states.shape[0]
 
-    assert dt.shape == (nheads, seqlen)
-    assert dA_cumsum.shape == (nheads, seqlen)
+    aligned_seqlen = dt.shape[-1] if align_blocks else seqlen
+
+    assert dt.shape == (nheads, aligned_seqlen)
+    assert dA_cumsum.shape == (nheads, aligned_seqlen)
     assert C.shape == (seqlen, ngroups, dstate)
     assert D.shape == (nheads, )
     assert CB.shape == (nblocks, ngroups, block_size, block_size)
@@ -326,6 +335,7 @@ def block_scan(
             stride_output_h=output.stride(1),
             stride_output_d=output.stride(2),
             BLOCK_SIZE_S=max(dstate, 16),
+            ALIGN_BLOCKS=align_blocks,
         )
 
     return output

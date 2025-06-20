@@ -8,6 +8,13 @@ from vllm.model_executor.layers.mamba.ops.mamba_ssm import softplus
 from vllm.triton_utils import tl, triton
 
 
+@triton.jit
+def align(start, pack_size=4):
+    aligned_start = ((start + (pack_size - 1)) // pack_size) * pack_size
+    aligned_start = tl.multiple_of(aligned_start, pack_size)
+    return aligned_start
+
+
 # from .utils import generate_autotune_combinations
 # @triton.autotune(
 #     configs=generate_autotune_combinations(
@@ -32,6 +39,7 @@ def block_cumsum_kernel(
     dt_ptr,
     A_ptr,
     block_cu_seqlens_ptr,
+    block_packed_cu_seqlens_ptr,
     dt_bias_ptr,
     # Outputs
     dA_cumsum_ptr,
@@ -44,6 +52,7 @@ def block_cumsum_kernel(
     stride_dt_h: tl.constexpr,
     stride_A_h: tl.constexpr,
     stride_block_cu_seqlens_n: tl.constexpr,
+    stride_block_packed_cu_seqlens_n: tl.constexpr,
     stride_dt_bias_h: tl.constexpr,
     stride_dA_cumsum_h,
     stride_dA_cumsum_t: tl.constexpr,
@@ -53,6 +62,7 @@ def block_cumsum_kernel(
     HAS_DT_BIAS: tl.constexpr,
     USE_DT_SOFTPLUS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
+    ALLIGN_OUTPUT_BLOCKS: tl.constexpr,
 ):
     pid_n = tl.program_id(0)  # block idx
     pid_h = tl.program_id(1)  # head idx
@@ -93,6 +103,14 @@ def block_cumsum_kernel(
     dA_cs = tl.cumsum(dA, axis=0)
 
     # Store back
+    if ALLIGN_OUTPUT_BLOCKS:
+        t_start = tl.load(block_packed_cu_seqlens_ptr +
+                          pid_n * stride_block_packed_cu_seqlens_n)
+        t_end = tl.load(block_packed_cu_seqlens_ptr +
+                        (pid_n + 1) * stride_block_packed_cu_seqlens_n)
+        offs_t = t_start + tl.arange(0, block_size)
+        mask_t = offs_t < t_end
+
     dA_cumsum_ptrs = (dA_cumsum_ptr + offs_t[:, None] * stride_dA_cumsum_t +
                       offs_h[None, :] * stride_dA_cumsum_h)
     tl.store(dA_cumsum_ptrs, dA_cs, mask=mask_t[:, None] & mask_h[None, :])
@@ -108,8 +126,11 @@ def block_cumsum(
     block_size,
     # metadata
     block_cu_seqlens,  # (nblocks+1,)
+    block_packed_cu_seqlens=None,  # (nblocks+1,)
+    packed_seqlen=-1,
     dt_bias=None,  # (nheads, )
     dt_softplus=False,
+    align_blocks=False,
 ):
     seqlen, nheads = dt.shape
     nblocks = block_cu_seqlens.shape[0] - 1
@@ -121,10 +142,18 @@ def block_cumsum(
     # dtype = dt.dtype
 
     # Allocate outputs
+    if align_blocks:
+        assert block_packed_cu_seqlens.shape == block_cu_seqlens.shape
+        seqlen = packed_seqlen
+
     dA_cumsum = torch.empty((nheads, seqlen),
                             device=device,
                             dtype=torch.float32)
     dt_out = torch.empty_like(dA_cumsum)
+    # dA_cumsum = torch.full((nheads, seqlen),float('-inf'),
+    #                         device=device,
+    #                         dtype=torch.float32)
+    # dt_out = torch.empty_like(dA_cumsum)
 
     # Launch grid
     grid = lambda META: (nblocks, triton.cdiv(nheads, META["BLOCK_SIZE_H"]))
@@ -133,6 +162,7 @@ def block_cumsum(
             dt_ptr=dt,
             A_ptr=A,
             block_cu_seqlens_ptr=block_cu_seqlens,
+            block_packed_cu_seqlens_ptr=block_packed_cu_seqlens,
             dt_bias_ptr=dt_bias,
             dA_cumsum_ptr=dA_cumsum,
             dt_out_ptr=dt_out,
@@ -142,6 +172,8 @@ def block_cumsum(
             stride_dt_h=dt.stride(1),
             stride_A_h=A.stride(0),
             stride_block_cu_seqlens_n=block_cu_seqlens.stride(0),
+            stride_block_packed_cu_seqlens_n=(block_packed_cu_seqlens.stride(0)
+                                              if align_blocks else 0),
             stride_dt_bias_h=0 if dt_bias is None else dt_bias.stride(0),
             stride_dA_cumsum_h=dA_cumsum.stride(0),
             stride_dA_cumsum_t=dA_cumsum.stride(1),
@@ -149,6 +181,7 @@ def block_cumsum(
             stride_dt_out_t=dt_out.stride(1),
             HAS_DT_BIAS=(dt_bias is not None),
             USE_DT_SOFTPLUS=dt_softplus,
+            ALLIGN_OUTPUT_BLOCKS=align_blocks,
         )
 
     return dA_cumsum, dt_out

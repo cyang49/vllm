@@ -6,6 +6,8 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+from .standalone_block_cumsum import align
+
 # try:
 #     from triton.language.extra.cuda.libdevice import fast_expf
 # except ImportError:
@@ -86,6 +88,7 @@ def state_passing_kernel(
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_S: tl.constexpr,
     IS_STORE_PREV_STATES: tl.constexpr,
+    ALIGN_BLOCKS: tl.constexpr,
 ):
     pid_h = tl.program_id(2)  # head idx
     pid_d = tl.program_id(0)
@@ -133,10 +136,15 @@ def state_passing_kernel(
                      mask=(mask_d[:, None] & mask_s[None, :]))
 
         # update state
+        t_start = tl.load(block_cu_seqlens_ptr + n * stride_block_cu_seqlens_n)
         t_end = tl.load(block_cu_seqlens_ptr +
                         (n + 1) * stride_block_cu_seqlens_n)
-        dA_cumsum_last = tl.load(dA_cumsum_ptr_base +
-                                 (t_end - 1) * stride_dA_cumsum_t)  # scalar
+        ntokens = t_end - t_start
+        align_t_start = align(t_start) if ALIGN_BLOCKS else t_start
+
+        dA_cumsum_last = tl.load(
+            dA_cumsum_ptr_base +
+            (align_t_start + ntokens - 1) * stride_dA_cumsum_t)  # scalar
         block_decay = tl.exp(dA_cumsum_last)
 
         state = tl.load(block_states_ptrs + n * stride_block_states_n,
@@ -167,6 +175,7 @@ def state_passing(
     block_req_idx,  # (nblocks, )
     req_cu_nblocks,  # (batch+1, )
     return_prev_states=True,
+    align_blocks=False,
 ):
 
     nheads, _ = dA_cumsum.shape
@@ -230,6 +239,7 @@ def state_passing(
             stride_final_states_d=final_states.stride(2),
             stride_final_states_s=final_states.stride(3),
             IS_STORE_PREV_STATES=return_prev_states,
+            ALIGN_BLOCKS=align_blocks,
         )
 
     return final_states, prev_states

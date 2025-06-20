@@ -7,6 +7,8 @@ import torch
 # from vllm.model_executor.layers.mamba.ops.mamba_ssm import softplus
 from vllm.triton_utils import tl, triton
 
+from .standalone_block_cumsum import align
+
 
 # from .utils import generate_autotune_combinations
 # @triton.autotune(
@@ -90,6 +92,7 @@ def fused_block_state_bmm_kernel(
     stride_CB_t1: tl.constexpr,
     # Meta-parameters
     FUSED_COMPUTE_CB: tl.constexpr,
+    ALIGN_BLOCKS: tl.constexpr,
     # finer grain decomposition of block size dimension
     BLOCK_SIZE_TT: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
@@ -114,6 +117,8 @@ def fused_block_state_bmm_kernel(
 
     # Load block start and end offset
     t_start = tl.load(block_cu_seqlens_ptr + pid_n * stride_block_cu_seqlens_n)
+    align_t_start = align(t_start) if ALIGN_BLOCKS else t_start
+
     t_end = tl.load(block_cu_seqlens_ptr +
                     (pid_n + 1) * stride_block_cu_seqlens_n)
     ntokens = t_end - t_start  # number of tokens in this block
@@ -124,8 +129,8 @@ def fused_block_state_bmm_kernel(
 
     # Compute base pointer addresses
     x_ptr_base = x_ptr + t_start * stride_x_t + pid_h * stride_x_h
-    dt_ptr_base = dt_ptr + t_start * stride_dt_t + pid_h * stride_dt_h
-    dA_cumsum_ptr_base = dA_cumsum_ptr + t_start * stride_dA_cumsum_t + pid_h * stride_dA_cumsum_h
+    dt_ptr_base = dt_ptr + align_t_start * stride_dt_t + pid_h * stride_dt_h
+    dA_cumsum_ptr_base = dA_cumsum_ptr + align_t_start * stride_dA_cumsum_t + pid_h * stride_dA_cumsum_h
     B_ptr_base = B_ptr + t_start * stride_B_t + pid_g * stride_B_g
 
     # Load last element value from dA_cumsum block
@@ -245,14 +250,17 @@ def fused_block_state_bmm(
     block_cu_seqlens,  # (nblocks+1,)
     states_in_fp32=True,
     FUSED_COMPUTE_CB=True,
+    align_blocks=False,
 ):
     seqlen, nheads, headdim = x.shape
     ngroups = B.shape[1]
     dstate = B.shape[-1]
     nblocks = block_cu_seqlens.shape[0] - 1
 
-    assert dt.shape == (nheads, seqlen)
-    assert dA_cumsum.shape == (nheads, seqlen)
+    aligned_seqlen = dt.shape[-1] if align_blocks else seqlen
+
+    assert dt.shape == (nheads, aligned_seqlen)
+    assert dA_cumsum.shape == (nheads, aligned_seqlen)
     assert C.shape == (seqlen, ngroups, dstate)
     assert C.shape == B.shape
 
@@ -314,6 +322,7 @@ def fused_block_state_bmm(
             stride_CB_t0=CB_strides[2],
             stride_CB_t1=CB_strides[3],
             FUSED_COMPUTE_CB=FUSED_COMPUTE_CB,
+            ALIGN_BLOCKS=align_blocks,
         )
 
     return block_states, CB
