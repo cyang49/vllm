@@ -209,8 +209,6 @@ def fused_block_scan_v1_kernel(
         prev_state = tl.load(prev_states_ptrs,
                              mask=(mask_d[:, None] & mask_s[None, :]),
                              other=0.0)
-    # DEBUG
-    # prev_state = tl.zeros((BLOCK_SIZE_D, BLOCK_SIZE_S), dtype=tl.float32)
 
     pid_g = pid_h // nheads_ngroups_ratio  # group idx
     t0_range = tl.arange(0, BLOCK_SIZE_T0)
@@ -245,8 +243,8 @@ def fused_block_scan_v1_kernel(
     C_ptrs = C_ptr_base + (
         offs_t0_global[:, None] * stride_C_t + offs_s[None, :] * stride_C_s
     )  # (BLOCK_SIZE_T0, dstate)
-    C = tl.load(C_ptrs, mask=(mask_t0[:, None] & mask_s[None, :]),
-                other=0.0).to(tl.float32)
+    C = tl.load(C_ptrs, mask=(mask_t0[:, None] & mask_s[None, :]), other=0.0)
+    prev_state = prev_state.to(C.dtype)
     acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0[:, None])
             )  #(BLOCK_SIZE_T0, headdim)
 

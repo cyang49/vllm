@@ -579,7 +579,77 @@ class MambaMixer2(CustomOp):
                     states_in_fp32=True,
                     FUSED_COMPUTE_CB=True,
                 )
+                # BUG: CB result is wrong
 
+                align_blocks = False
+                # dA_cumsum_x, dt_out_x = block_cumsum(
+                #     dt=dt_p,
+                #     A=self.A,
+                #     block_size=block_size,
+                #     block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                #     dt_bias=self.dt_bias,
+                #     dt_softplus=True,
+                #     align_blocks=align_blocks,
+                #     block_packed_cu_seqlens=mamba2_metadata.
+                #     block_packed_cu_seqlens,
+                #     packed_seqlen=mamba2_metadata.packed_seqlen,
+                # )
+
+                _, CB_x = fused_block_state_bmm(
+                    x=x_p,
+                    dt=dt_out,
+                    dA_cumsum=dA_cumsum,
+                    B=B_p,
+                    C=C_p,
+                    block_size=block_size,
+                    block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                    states_in_fp32=True,
+                    FUSED_COMPUTE_CB=True,
+                    align_blocks=align_blocks,
+                    block_packed_cu_seqlens=mamba2_metadata.
+                    block_packed_cu_seqlens,
+                )
+                # print(f"{dA_cumsum[-1, -1]=}")
+                # print(f"{dA_cumsum_x[-1, -1]=}")
+                # print(f"{dt_out[-1, -1]=}")
+                # print(f"{dt_out_x[-1, -1]=}")
+                # print(f"{block_states[-1, -1, -1]=}")
+                # print(f"{block_states_x[-1, -1, -1]=}")
+                # print(f"{CB[-1, -1, -1]=}")
+                # print(f"{CB_x[-1, -1, -1]=}")
+
+                # final_states, block_states = state_passing(
+                #     dA_cumsum=dA_cumsum,
+                #     block_states=block_states,
+                #     initial_states=initial_states,
+                #     block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                #     block_req_idx=mamba2_metadata.block_req_idx,
+                #     req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
+                #     return_prev_states=True,
+                #     out_dtype=C_p.dtype,
+                #     align_blocks=align_blocks,
+                #     block_packed_cu_seqlens=mamba2_metadata.
+                #     block_packed_cu_seqlens,
+                # )
+
+                # # Give pre-computed block_states
+                # _, scan_output, _ = fused_block_scan(
+                #     x=x_p,
+                #     dt=dt_out,
+                #     dA_cumsum=dA_cumsum,
+                #     block_states=block_states,
+                #     initial_states=initial_states,
+                #     C=C_p,
+                #     D=self.D,
+                #     CB=CB_x,
+                #     block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                #     block_req_idx=mamba2_metadata.block_req_idx,
+                #     req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
+                #     return_prev_states=False,
+                #     fused_state_passing=False,
+                # )
+
+                # Fused state passing - Confirmed working
                 final_states, scan_output, _ = fused_block_scan(
                     x=x_p,
                     dt=dt_out,
@@ -588,13 +658,27 @@ class MambaMixer2(CustomOp):
                     initial_states=initial_states,
                     C=C_p,
                     D=self.D,
-                    CB=CB,
+                    CB=CB_x,
                     block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
                     block_req_idx=mamba2_metadata.block_req_idx,
                     req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
                     return_prev_states=False,
                     fused_state_passing=True,
                 )
+
+                # scan_output = block_scan(
+                #     x=x_p,
+                #     dt=dt_out,
+                #     dA_cumsum=dA_cumsum,
+                #     prev_states=block_states,
+                #     C=C_p,
+                #     D=self.D,
+                #     CB=CB_x,
+                #     block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                #     align_blocks=align_blocks,
+                #     block_packed_cu_seqlens=mamba2_metadata.
+                #     block_packed_cu_seqlens,
+                # )
 
             else:  # 4 kernel control flow
                 align_blocks = True
