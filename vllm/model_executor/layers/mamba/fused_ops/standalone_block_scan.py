@@ -126,12 +126,17 @@ def block_scan_kernel(
     t_start = tl.load(block_cu_seqlens_ptr + pid_n * stride_block_cu_seqlens_n)
     t_end = tl.load(block_cu_seqlens_ptr +
                     (pid_n + 1) * stride_block_cu_seqlens_n)
+
     ntokens = t_end - t_start
+    align_t_start, align_t_end = t_start, t_end
     if ALIGN_BLOCKS:
         align_t_start = tl.load(block_packed_cu_seqlens_ptr +
                                 pid_n * stride_block_packed_cu_seqlens_n)
-        align_t_start = tl.multiple_of(
-            align_t_start, 4)  # not sure if the hint works in if block
+        align_t_end = tl.load(block_packed_cu_seqlens_ptr +
+                              (pid_n + 1) * stride_block_packed_cu_seqlens_n)
+        align_t_start = tl.multiple_of(align_t_start, 4)
+        align_t_end = tl.multiple_of(align_t_end, 4)
+    align_ntokens = align_t_end - align_t_start
 
     # Mask out-of-bound tokens
     mask_d = offs_d < headdim
@@ -146,6 +151,7 @@ def block_scan_kernel(
     offs_t0_global = t_start + offs_t0_local
     aligned_t0_global = align_t_start + offs_t0_local
     mask_t0 = offs_t0_local < ntokens
+    aligned_mask_t0 = offs_t0_local < align_ntokens
 
     # compute base pointers
     x_ptr_base = x_ptr + pid_h * stride_x_h
@@ -167,7 +173,8 @@ def block_scan_kernel(
 
     dA_cumsum_t0_ptrs = dA_cumsum_ptr_h + (
         aligned_t0_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_T0,)
-    dA_cumsum_t0 = tl.load(dA_cumsum_t0_ptrs, mask=mask_t0, other=0.0)
+    dA_cumsum_t0 = tl.load(dA_cumsum_t0_ptrs, mask=aligned_mask_t0, other=0.0)
+    dA_cumsum_t0 = tl.where(mask_t0, dA_cumsum_t0, 0.0)
 
     k_range = tl.arange(0, BLOCK_SIZE_K)
 
@@ -219,13 +226,18 @@ def block_scan_kernel(
         offs_t1_global = t_start + offs_t1_local
         aligned_t1_global = align_t_start + offs_t1_local
         mask_t1 = offs_t1_local < ntokens
+        aligned_mask_t1 = offs_t1_local < align_ntokens
 
         dA_cumsum_t1_ptrs = dA_cumsum_ptr_h + (
             aligned_t1_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_K,)
         dt_t1_ptrs = dt_ptr_base + (aligned_t1_global * stride_dt_t
                                     )  # (BLOCK_SIZE_K,)
-        dt_t1 = tl.load(dt_t1_ptrs, mask=mask_t1, other=0.0)
-        dA_cumsum_t1 = tl.load(dA_cumsum_t1_ptrs, mask=mask_t1, other=0.0)
+        dt_t1 = tl.load(dt_t1_ptrs, mask=aligned_mask_t1, other=0.0)
+        dA_cumsum_t1 = tl.load(dA_cumsum_t1_ptrs,
+                               mask=aligned_mask_t1,
+                               other=0.0)
+        dt_t1 = tl.where(mask_t1, dt_t1, 0.0)
+        dA_cumsum_t1 = tl.where(mask_t1, dA_cumsum_t1, 0.0)
         x_t1_ptrs = x_ptr_base + (
             offs_t1_global[:, None] * stride_x_t + offs_d[None, :] * stride_x_d
         )  # (BLOCK_SIZE_K, BLOCK_SIZE_D)
