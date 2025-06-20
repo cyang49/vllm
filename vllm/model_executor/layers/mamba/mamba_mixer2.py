@@ -602,6 +602,19 @@ class MambaMixer2(CustomOp):
                 block_packed_cu_seqlens,
             )
 
+            final_states, prev_states = state_passing(
+                dA_cumsum=dA_cumsum,
+                block_states=block_states,
+                initial_states=initial_states,
+                block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                block_req_idx=mamba2_metadata.block_req_idx,
+                req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
+                return_prev_states=True,
+                align_blocks=align_blocks,
+                block_packed_cu_seqlens=mamba2_metadata.
+                block_packed_cu_seqlens,
+            )
+
             def restore_packed(x, block_cu_seqlens, block_ntokens):
                 out = []
                 xT = x.T
@@ -620,17 +633,6 @@ class MambaMixer2(CustomOp):
             # print(f"{dA_cumsum[-1]=}, {dA_cumsum.shape=}")
 
             align_blocks = False
-
-            final_states, prev_states = state_passing(
-                dA_cumsum=dA_cumsum,
-                block_states=block_states,
-                initial_states=initial_states,
-                block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
-                block_req_idx=mamba2_metadata.block_req_idx,
-                req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
-                return_prev_states=True,
-                align_blocks=align_blocks,
-            )
 
             # _, scan_output, _ = fused_block_scan(
             #     x=x_p,

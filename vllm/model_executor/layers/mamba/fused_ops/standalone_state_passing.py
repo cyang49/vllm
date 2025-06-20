@@ -6,8 +6,6 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-from .standalone_block_cumsum import align
-
 # try:
 #     from triton.language.extra.cuda.libdevice import fast_expf
 # except ImportError:
@@ -53,6 +51,7 @@ def state_passing_kernel(
     block_states_ptr,
     init_states_ptr,
     block_cu_seqlens_ptr,
+    block_packed_cu_seqlens_ptr,
     block_req_idx_ptr,
     req_cu_nblocks_ptr,
     # Outputs
@@ -74,6 +73,7 @@ def state_passing_kernel(
     stride_init_states_d: tl.constexpr,
     stride_init_states_s: tl.constexpr,
     stride_block_cu_seqlens_n: tl.constexpr,
+    stride_block_packed_cu_seqlens_n: tl.constexpr,
     stride_block_req_idx_n: tl.constexpr,
     stride_req_cu_nblocks_b: tl.constexpr,
     stride_prev_states_n: tl.constexpr,
@@ -140,7 +140,12 @@ def state_passing_kernel(
         t_end = tl.load(block_cu_seqlens_ptr +
                         (n + 1) * stride_block_cu_seqlens_n)
         ntokens = t_end - t_start
-        align_t_start = align(t_start) if ALIGN_BLOCKS else t_start
+        align_t_start = t_start
+        if ALIGN_BLOCKS:
+            align_t_start = tl.load(block_packed_cu_seqlens_ptr +
+                                    n * stride_block_packed_cu_seqlens_n)
+            align_t_start = tl.multiple_of(
+                align_t_start, 4)  # not sure if the hint works in if block
 
         dA_cumsum_last = tl.load(
             dA_cumsum_ptr_base +
@@ -174,6 +179,7 @@ def state_passing(
     block_cu_seqlens,  # (nblocks+1,)
     block_req_idx,  # (nblocks, )
     req_cu_nblocks,  # (batch+1, )
+    block_packed_cu_seqlens=None,  # (nblocks+1,)
     return_prev_states=True,
     align_blocks=False,
 ):
@@ -182,11 +188,13 @@ def state_passing(
     nblocks, _, headdim, dstate = block_states.shape
     batch = initial_states.shape[0]
 
-    # assert block_states.shape == (nblocks, nheads, headdim, dstate)
+    assert block_states.shape == (nblocks, nheads, headdim, dstate)
     assert initial_states.shape == (batch, nheads, headdim, dstate)
     assert block_cu_seqlens.shape == (nblocks + 1, )
     assert block_req_idx.shape == (nblocks, )
     assert req_cu_nblocks.shape == (batch + 1, )
+    if align_blocks:
+        assert block_packed_cu_seqlens.shape == block_cu_seqlens.shape
 
     device = dA_cumsum.device
 
@@ -210,6 +218,7 @@ def state_passing(
             block_states_ptr=block_states,
             init_states_ptr=initial_states,
             block_cu_seqlens_ptr=block_cu_seqlens,
+            block_packed_cu_seqlens_ptr=block_packed_cu_seqlens,
             block_req_idx_ptr=block_req_idx,
             req_cu_nblocks_ptr=req_cu_nblocks,
             prev_states_ptr=prev_states,
@@ -228,6 +237,8 @@ def state_passing(
             stride_init_states_d=initial_states.stride(2),
             stride_init_states_s=initial_states.stride(3),
             stride_block_cu_seqlens_n=block_cu_seqlens.stride(0),
+            stride_block_packed_cu_seqlens_n=(block_packed_cu_seqlens.stride(0)
+                                              if align_blocks else 0),
             stride_block_req_idx_n=block_req_idx.stride(0),
             stride_req_cu_nblocks_b=req_cu_nblocks.stride(0),
             stride_prev_states_n=prev_state_strides[0],
