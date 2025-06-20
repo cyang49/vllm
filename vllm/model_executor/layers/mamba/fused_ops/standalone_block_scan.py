@@ -134,8 +134,8 @@ def block_scan_kernel(
                                 pid_n * stride_block_packed_cu_seqlens_n)
         align_t_end = tl.load(block_packed_cu_seqlens_ptr +
                               (pid_n + 1) * stride_block_packed_cu_seqlens_n)
-        align_t_start = tl.multiple_of(align_t_start, 4)
-        align_t_end = tl.multiple_of(align_t_end, 4)
+        tl.multiple_of(align_t_start, 4)
+        tl.multiple_of(align_t_end, 4)
     align_ntokens = align_t_end - align_t_start
 
     # Mask out-of-bound tokens
@@ -143,7 +143,6 @@ def block_scan_kernel(
 
     # Set base pointers
     dA_cumsum_ptr_h = dA_cumsum_ptr + pid_h * stride_dA_cumsum_h
-
     pid_g = pid_h // nheads_ngroups_ratio  # group idx
     t0_range = tl.arange(0, BLOCK_SIZE_T0)
     t0 = pid_t0 * BLOCK_SIZE_T0
@@ -173,6 +172,8 @@ def block_scan_kernel(
 
     dA_cumsum_t0_ptrs = dA_cumsum_ptr_h + (
         aligned_t0_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_T0,)
+
+    # FIXME: These loads are 32-bit width not sure why
     dA_cumsum_t0 = tl.load(dA_cumsum_t0_ptrs, mask=aligned_mask_t0, other=0.0)
     dA_cumsum_t0 = tl.where(mask_t0, dA_cumsum_t0, 0.0)
 
@@ -196,7 +197,7 @@ def block_scan_kernel(
         C = tl.load(C_ptrs,
                     mask=(mask_t0[:, None] & mask_s[None, :]),
                     other=0.0)
-        acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0[:, None])
+        acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0)[:, None]
                 )  #(BLOCK_SIZE_T0, BLOCK_SIZE_D)
     else:
         for ss in range(0, dstate, BLOCK_SIZE_K):
@@ -217,7 +218,7 @@ def block_scan_kernel(
             C = tl.load(C_ptrs,
                         mask=(mask_t0[:, None] & mask_ss[None, :]),
                         other=0.0)
-            acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0[:, None])
+            acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0)[:, None]
                     )  #(BLOCK_SIZE_T0, BLOCK_SIZE_D)
 
     for t1 in range(0, ntokens, BLOCK_SIZE_K):
