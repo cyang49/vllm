@@ -71,6 +71,7 @@ def block_cumsum_kernel(
     t_start = tl.load(block_cu_seqlens_ptr + pid_n * stride_block_cu_seqlens_n)
     t_end = tl.load(block_cu_seqlens_ptr +
                     (pid_n + 1) * stride_block_cu_seqlens_n)
+    ntokens = t_end - t_start
 
     offs_t = t_start + tl.arange(0, block_size)
     offs_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
@@ -104,12 +105,19 @@ def block_cumsum_kernel(
 
     # Store back
     if ALLIGN_OUTPUT_BLOCKS:
+        # NOTE: the indices in block_packed_cu_seqlens can be padded
+        #       to the pack_size. As such, while t_start points to
+        #       actual starting position containing real data,
+        #       (t_end-1) may point to a padded position.
+        #       Also, (t_end-t_start) would be the count including
+        #       padded elements. To get the real token count, use
+        #       either block_cu_seqlen or block_ntokens.
         t_start = tl.load(block_packed_cu_seqlens_ptr +
                           pid_n * stride_block_packed_cu_seqlens_n)
         t_end = tl.load(block_packed_cu_seqlens_ptr +
                         (pid_n + 1) * stride_block_packed_cu_seqlens_n)
         offs_t = t_start + tl.arange(0, block_size)
-        mask_t = offs_t < t_end
+        mask_t = offs_t < (t_start + ntokens)
 
     dA_cumsum_ptrs = (dA_cumsum_ptr + offs_t[:, None] * stride_dA_cumsum_t +
                       offs_h[None, :] * stride_dA_cumsum_h)
@@ -150,10 +158,6 @@ def block_cumsum(
                             device=device,
                             dtype=torch.float32)
     dt_out = torch.empty_like(dA_cumsum)
-    # dA_cumsum = torch.full((nheads, seqlen),float('-inf'),
-    #                         device=device,
-    #                         dtype=torch.float32)
-    # dt_out = torch.empty_like(dA_cumsum)
 
     # Launch grid
     grid = lambda META: (nblocks, triton.cdiv(nheads, META["BLOCK_SIZE_H"]))
