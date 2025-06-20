@@ -182,6 +182,7 @@ def state_passing(
     block_packed_cu_seqlens=None,  # (nblocks+1,)
     return_prev_states=True,
     align_blocks=False,
+    out_dtype=None,
 ):
 
     nheads, _ = dA_cumsum.shape
@@ -199,10 +200,11 @@ def state_passing(
     device = dA_cumsum.device
 
     # Allocate outputs
-    prev_states = (torch.empty_like(block_states)
+    out_dtype = block_states.dtype if out_dtype is None else out_dtype
+    prev_states = (torch.empty_like(block_states, dtype=out_dtype)
                    if return_prev_states else None)
     final_states = torch.empty((batch, nheads, headdim, dstate),
-                               dtype=block_states.dtype,
+                               dtype=out_dtype,
                                device=device)
     prev_state_strides = ((0, 0, 0, 0) if prev_states is None else
                           (prev_states.stride(0), prev_states.stride(1),

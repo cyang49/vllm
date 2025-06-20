@@ -48,6 +48,21 @@ except ImportError:
 #     ],
 #     key=[],
 # )
+# DEBUG: match best config of chunk_scan_fwd
+# @triton.autotune(  # best for non-tiled dstate
+#     configs=[
+#         triton.Config(
+#             {
+#                 'BLOCK_SIZE_T0': 32,
+#                 'BLOCK_SIZE_D': 64,
+#                 'BLOCK_SIZE_K': 32,
+#                 'USE_FAST_MATH': False,
+#             },
+#             num_warps=2,
+#             num_stages=5),  # effectively turns off sw pipelining
+#     ],
+#     key=[],
+# )
 @triton.autotune(  # best for non-tiled dstate
     configs=[
         triton.Config(
@@ -197,8 +212,12 @@ def block_scan_kernel(
         C = tl.load(C_ptrs,
                     mask=(mask_t0[:, None] & mask_s[None, :]),
                     other=0.0)
-        acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0)[:, None]
-                )  #(BLOCK_SIZE_T0, BLOCK_SIZE_D)
+        if USE_FAST_MATH:
+            acc += mul_rn(tl.dot(C, prev_state.T),
+                          fast_expf(dA_cumsum_t0)[:, None])
+        else:
+            acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0)[:, None]
+                    )  #(BLOCK_SIZE_T0, BLOCK_SIZE_D)
     else:
         for ss in range(0, dstate, BLOCK_SIZE_K):
             offs_ss = ss + k_range
@@ -218,8 +237,12 @@ def block_scan_kernel(
             C = tl.load(C_ptrs,
                         mask=(mask_t0[:, None] & mask_ss[None, :]),
                         other=0.0)
-            acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0)[:, None]
-                    )  #(BLOCK_SIZE_T0, BLOCK_SIZE_D)
+            if USE_FAST_MATH:
+                acc += mul_rn(tl.dot(C, prev_state.T),
+                              fast_expf(dA_cumsum_t0)[:, None])
+            else:
+                acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0)[:, None]
+                        )  #(BLOCK_SIZE_T0, BLOCK_SIZE_D)
 
     for t1 in range(0, ntokens, BLOCK_SIZE_K):
         mask_t1 = k_range < (ntokens - t1)  # (BLOCK_SIZE_K,)

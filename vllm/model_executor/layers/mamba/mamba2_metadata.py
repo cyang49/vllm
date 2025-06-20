@@ -200,5 +200,5 @@ def prepare_mamba2_metadata(
                           block_req_idx=block_req_idx,
                           block_ntokens=block_ntokens,
                           block_packed_cu_seqlens=block_packed_cu_seqlens,
-                          packed_seqlen=block_packed_cu_seqlens[-1]
+                          packed_seqlen=block_packed_cu_seqlens[-1].item()
                           if block_packed_cu_seqlens is not None else -1)

@@ -610,6 +610,7 @@ class MambaMixer2(CustomOp):
                 block_req_idx=mamba2_metadata.block_req_idx,
                 req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
                 return_prev_states=True,
+                out_dtype=C_p.dtype,
                 align_blocks=align_blocks,
                 block_packed_cu_seqlens=mamba2_metadata.
                 block_packed_cu_seqlens,
