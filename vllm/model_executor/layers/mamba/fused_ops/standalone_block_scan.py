@@ -11,8 +11,6 @@ try:
 except ImportError:
     from triton.language.math import add_rn, fast_expf, mul_rn
 
-from .standalone_block_cumsum import align
-
 # Notations for readability
 #   - b: batch
 #   - h: nheads
@@ -74,6 +72,7 @@ def block_scan_kernel(
     D_ptr,
     CB_ptr,
     block_cu_seqlens_ptr,
+    block_packed_cu_seqlens_ptr,
     prev_states_ptr,
     # Outputs
     output_ptr,
@@ -98,6 +97,7 @@ def block_scan_kernel(
     stride_CB_t0: tl.constexpr,
     stride_CB_t1: tl.constexpr,
     stride_block_cu_seqlens_n: tl.constexpr,
+    stride_block_packed_cu_seqlens_n: tl.constexpr,
     stride_prev_states_n: tl.constexpr,
     stride_prev_states_h: tl.constexpr,
     stride_prev_states_d: tl.constexpr,
@@ -127,7 +127,11 @@ def block_scan_kernel(
     t_end = tl.load(block_cu_seqlens_ptr +
                     (pid_n + 1) * stride_block_cu_seqlens_n)
     ntokens = t_end - t_start
-    align_t_start = align(t_start, 4) if ALIGN_BLOCKS else t_start
+    if ALIGN_BLOCKS:
+        align_t_start = tl.load(block_packed_cu_seqlens_ptr +
+                                pid_n * stride_block_packed_cu_seqlens_n)
+        align_t_start = tl.multiple_of(
+            align_t_start, 4)  # not sure if the hint works in if block
 
     # Mask out-of-bound tokens
     mask_d = offs_d < headdim
@@ -271,6 +275,7 @@ def block_scan(
     CB,  # (nblocks, ngroups, block_size, block_size)
     # metadata
     block_cu_seqlens,  # (nblocks+1,)
+    block_packed_cu_seqlens=None,  # (nblocks+1,)
     align_blocks=False,
 ):
     seqlen, nheads, headdim = x.shape
@@ -288,6 +293,8 @@ def block_scan(
     assert CB.shape == (nblocks, ngroups, block_size, block_size)
     assert prev_states.shape == (nblocks, nheads, headdim, dstate)
     assert block_cu_seqlens.shape == (nblocks + 1, )
+    if align_blocks:
+        assert block_packed_cu_seqlens.shape == block_cu_seqlens.shape
 
     # Allocate outputs
     output = torch.empty_like(x)
@@ -306,6 +313,7 @@ def block_scan(
             D_ptr=D,
             CB_ptr=CB,
             block_cu_seqlens_ptr=block_cu_seqlens,
+            block_packed_cu_seqlens_ptr=block_packed_cu_seqlens,
             prev_states_ptr=prev_states,
             output_ptr=output,
             headdim=headdim,
@@ -327,6 +335,8 @@ def block_scan(
             stride_CB_t0=CB.stride(2),
             stride_CB_t1=CB.stride(3),
             stride_block_cu_seqlens_n=block_cu_seqlens.stride(0),
+            stride_block_packed_cu_seqlens_n=(block_packed_cu_seqlens.stride(0)
+                                              if align_blocks else 0),
             stride_prev_states_n=prev_states.stride(0),
             stride_prev_states_h=prev_states.stride(1),
             stride_prev_states_d=prev_states.stride(2),
