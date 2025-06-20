@@ -25,11 +25,19 @@ def align(start, pack_size=4):
 #         ),
 #     key=[],
 # )
-@triton.autotune(
+# @triton.autotune( # H100, align_blocks=False
+#     configs=[
+#         triton.Config({
+#             'BLOCK_SIZE_H': 8,
+#         }, num_warps=8, num_stages=3),
+#     ],
+#     key=[],
+# )
+@triton.autotune(  # H100, align_blocks=True
     configs=[
         triton.Config({
             'BLOCK_SIZE_H': 8,
-        }, num_warps=8, num_stages=3),
+        }, num_warps=4, num_stages=3),
     ],
     key=[],
 )
@@ -105,6 +113,7 @@ def block_cumsum_kernel(
 
     # Store back
     if ALLIGN_OUTPUT_BLOCKS:
+        tl.static_assert(block_size % 4 == 0)
         # NOTE: the indices in block_packed_cu_seqlens can be padded
         #       to the pack_size. As such, while t_start points to
         #       actual starting position containing real data,
@@ -119,6 +128,7 @@ def block_cumsum_kernel(
         offs_t = t_start + tl.arange(0, block_size)
         mask_t = offs_t < (t_start + ntokens)
 
+    # FIXME: stores are not coalesced?
     dA_cumsum_ptrs = (dA_cumsum_ptr + offs_t[:, None] * stride_dA_cumsum_t +
                       offs_h[None, :] * stride_dA_cumsum_h)
     tl.store(dA_cumsum_ptrs, dA_cs, mask=mask_t[:, None] & mask_h[None, :])

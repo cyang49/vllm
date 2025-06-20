@@ -4,10 +4,7 @@
 
 import torch
 
-# from vllm.model_executor.layers.mamba.ops.mamba_ssm import softplus
 from vllm.triton_utils import tl, triton
-
-from .standalone_block_cumsum import align
 
 
 # from .utils import generate_autotune_combinations
@@ -24,6 +21,7 @@ from .standalone_block_cumsum import align
 #         ),
 #     key=[],
 # )
+#Triton autotuning for function fused_block_state_bmm_kernel finished after 126.16s; best config selected: BLOCK_SIZE_TT: 64, BLOCK_SIZE_D: 64, BLOCK_SIZE_S: 64, BLOCK_SIZE_T0: 16, BLOCK_SIZE_T1: 16, num_warps: 2, num_ctas: 1, num_stages: 3, num_buffers_warp_spec: 0, num_consumer_groups: 0, reg_dec_producer: 0, reg_inc_consumer: 0, maxnreg: None;
 # Best found on H100 # fused
 @triton.autotune(
     configs=[
@@ -37,16 +35,16 @@ from .standalone_block_cumsum import align
             },
             num_warps=2,
             num_stages=3),
-        triton.Config(
-            {
-                'BLOCK_SIZE_TT': 64,
-                'BLOCK_SIZE_D': 64,
-                'BLOCK_SIZE_S': 64,
-                'BLOCK_SIZE_T0': 16,
-                'BLOCK_SIZE_T1': 16,
-            },
-            num_warps=4,
-            num_stages=3),
+        # triton.Config(
+        #     {
+        #         'BLOCK_SIZE_TT': 128,
+        #         'BLOCK_SIZE_D': 64,
+        #         'BLOCK_SIZE_S': 64,
+        #         'BLOCK_SIZE_T0': 16,
+        #         'BLOCK_SIZE_T1': 16,
+        #     },
+        #     num_warps=4,
+        #     num_stages=3),
     ],
     key=[],
 )
@@ -58,6 +56,7 @@ def fused_block_state_bmm_kernel(
     B_ptr,
     C_ptr,
     block_cu_seqlens_ptr,
+    block_packed_cu_seqlens_ptr,
     # Outputs
     dA_cumsum_ptr,
     block_states_ptr,
@@ -82,6 +81,7 @@ def fused_block_state_bmm_kernel(
     stride_C_g: tl.constexpr,
     stride_C_s: tl.constexpr,
     stride_block_cu_seqlens_n: tl.constexpr,
+    stride_block_packed_cu_seqlens_n: tl.constexpr,
     stride_block_states_n: tl.constexpr,
     stride_block_states_h: tl.constexpr,
     stride_block_states_d: tl.constexpr,
@@ -117,7 +117,12 @@ def fused_block_state_bmm_kernel(
 
     # Load block start and end offset
     t_start = tl.load(block_cu_seqlens_ptr + pid_n * stride_block_cu_seqlens_n)
-    align_t_start = align(t_start) if ALIGN_BLOCKS else t_start
+    align_t_start = t_start
+    if ALIGN_BLOCKS:
+        align_t_start = tl.load(block_packed_cu_seqlens_ptr +
+                                pid_n * stride_block_packed_cu_seqlens_n)
+        align_t_start = tl.multiple_of(
+            align_t_start, 4)  # not sure if the hint works in if block
 
     t_end = tl.load(block_cu_seqlens_ptr +
                     (pid_n + 1) * stride_block_cu_seqlens_n)
@@ -248,6 +253,7 @@ def fused_block_state_bmm(
     block_size,
     # metadata
     block_cu_seqlens,  # (nblocks+1,)
+    block_packed_cu_seqlens=None,  # (nblocks+1,)
     states_in_fp32=True,
     FUSED_COMPUTE_CB=True,
     align_blocks=False,
@@ -263,6 +269,8 @@ def fused_block_state_bmm(
     assert dA_cumsum.shape == (nheads, aligned_seqlen)
     assert C.shape == (seqlen, ngroups, dstate)
     assert C.shape == B.shape
+    if align_blocks:
+        assert block_packed_cu_seqlens.shape == block_cu_seqlens.shape
 
     device = x.device
     dtype = x.dtype
@@ -293,6 +301,7 @@ def fused_block_state_bmm(
             B_ptr=B,
             C_ptr=C,
             block_cu_seqlens_ptr=block_cu_seqlens,
+            block_packed_cu_seqlens_ptr=block_packed_cu_seqlens,
             block_states_ptr=block_states,
             CB_ptr=CB,
             block_size=block_size,
@@ -313,6 +322,8 @@ def fused_block_state_bmm(
             stride_C_g=C.stride(1),
             stride_C_s=C.stride(2),
             stride_block_cu_seqlens_n=block_cu_seqlens.stride(0),
+            stride_block_packed_cu_seqlens_n=(block_packed_cu_seqlens.stride(0)
+                                              if align_blocks else 0),
             stride_block_states_n=block_states.stride(0),
             stride_block_states_h=block_states.stride(1),
             stride_block_states_d=block_states.stride(2),
