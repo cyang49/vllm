@@ -35,12 +35,20 @@ from vllm.triton_utils import tl, triton
 # )
 @triton.autotune(
     configs=[
-        triton.Config({
-            'BLOCK_SIZE_D': 16,
-            'BLOCK_SIZE_S': 64,
-        },
-                      num_warps=4,
-                      num_stages=5),
+        triton.Config(
+            {
+                'BLOCK_SIZE_D': 16,  # best
+                'BLOCK_SIZE_S': 64,
+            },
+            num_warps=4,
+            num_stages=5),
+        triton.Config(
+            {
+                'BLOCK_SIZE_D': 32,  # best for non aligned?
+                'BLOCK_SIZE_S': 64,
+            },
+            num_warps=4,
+            num_stages=5),
     ],
     key=[],
 )
