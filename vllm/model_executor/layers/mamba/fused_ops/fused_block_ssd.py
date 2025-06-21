@@ -22,7 +22,7 @@ from vllm.triton_utils import tl, triton
 # @triton.autotune(
 #     configs=generate_autotune_combinations(
 #         spec={'BLOCK_SIZE_TT': [32, 64, 128],
-#               'BLOCK_SIZE_D': [32, 64, 128],
+#               'BLOCK_SIZE_D': [32], # WATCHOUT!! This affects CB decomposition
 #               'BLOCK_SIZE_SS': [32, 64],
 #               'BLOCK_SIZE_T0': [16],
 #               'BLOCK_SIZE_T1': [16],
@@ -37,7 +37,7 @@ from vllm.triton_utils import tl, triton
         triton.Config(
             {
                 'BLOCK_SIZE_TT': 32,
-                'BLOCK_SIZE_D': 64,
+                'BLOCK_SIZE_D': 32,  # WATCHOUT!! This affects CB decomposition
                 'BLOCK_SIZE_SS': 32,
                 'BLOCK_SIZE_T0': 16,
                 'BLOCK_SIZE_T1': 16,
@@ -227,11 +227,20 @@ def fused_block_ssd_v2_kernel(  # 0.112 mseconds for 8 full blocks on H100
         # work of 1 group among (nheads_ngroups_ratio x ndblocks) programs
 
         ndblocks = tl.num_programs(0)
-        # ntcblocks = tl.cdiv(block_size, BLOCK_SIZE_T0)
+        ntcblocks = tl.cdiv(block_size, BLOCK_SIZE_T0)
         ntbblocks = tl.cdiv(block_size, BLOCK_SIZE_T1)
-        # assert (ndblocks*nheads_ngroups_ratio) == (ntcblocks*ntbblocks), "parallelism check"
+        # FIXME: Why does static assert not work?
+        # tl.static_assert(
+        #     (((dstate // BLOCK_SIZE_D) * nheads_ngroups_ratio)
+        #     == ((block_size // BLOCK_SIZE_T0) * (block_size // BLOCK_SIZE_T1))),
+        #     "parallelism check must pass for correct remapping")
+        # NOTE: device_assert is effective only if env TRITON_DEBUG=1 is set
+        tl.device_assert(
+            ((ndblocks * nheads_ngroups_ratio) == (ntcblocks * ntbblocks)),
+            "parallelism check must pass for correct remapping")
 
-        # map from (nheads, ndblocks) to index space of (ngroups, ntcblocks, ntbblocks)
+        # map from (nheads, ndblocks) to index space of (ngroups, ntcblocks,
+        # ntbblocks)
         flat_idx = (
             (pid_h % nheads_ngroups_ratio)  # get group local head index
             * ndblocks + pid_d)
@@ -323,9 +332,10 @@ def fused_block_ssd(
         dtype=torch.float32 if states_in_fp32 else dtype,
         device=device)
 
-    CB = (torch.empty((nblocks, ngroups, block_size, block_size),
-                      dtype=torch.float32,
-                      device=device) if FUSED_COMPUTE_CB else None)
+    CB = (torch.full((nblocks, ngroups, block_size, block_size),
+                     float('-inf'),
+                     dtype=torch.float32,
+                     device=device) if FUSED_COMPUTE_CB else None)
     CB_strides = (0, 0, 0, 0) if CB is None else (CB.stride(0), CB.stride(1),
                                                   CB.stride(2), CB.stride(3))
     MIN_BLOCK_SIZE = 16  # for tl.dot limitation
