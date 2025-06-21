@@ -26,6 +26,9 @@ class Mamba2Metadata:
     block_req_idx: torch.Tensor
     block_ntokens: torch.Tensor
 
+    block_packed_cu_seqlens: torch.Tensor
+    packed_seqlen: int
+
 
 def get_platform_metadata_classes() -> tuple[type[AttentionMetadata], ...]:
     """Returns the appropriate metadata classes for the current platform."""
@@ -78,8 +81,10 @@ def _query_start_loc_to_chunk_indices_offsets(query_start_loc: torch.Tensor,
     return chunk_indices, chunk_offsets
 
 
-def _get_block_ranges(query_start_loc: torch.Tensor, block_size: int,
-                      sum_seqlens: int):
+def _get_block_ranges(query_start_loc: torch.Tensor,
+                      block_size: int,
+                      sum_seqlens: int,
+                      pack_size: int = 4):
     device = query_start_loc.device
     seqlens = torch.diff(query_start_loc)
     nreqs = len(seqlens)
@@ -114,6 +119,13 @@ def _get_block_ranges(query_start_loc: torch.Tensor, block_size: int,
         torch.cumsum(block_ntokens, dim=0),
     ])
 
+    # metadata for packed fp32 vectorization
+    block_packed_fill = (pack_size - block_ntokens % pack_size) % pack_size
+    block_packed_cu_seqlens = torch.cat([
+        torch.zeros([1], dtype=torch.int32, device=device),
+        torch.cumsum(block_packed_fill, dim=0),
+    ]) + block_cu_seqlens
+
     # request level metadata
     req_cu_nblocks = torch.cat([
         torch.zeros([1], dtype=torch.int32, device=device),
@@ -122,7 +134,8 @@ def _get_block_ranges(query_start_loc: torch.Tensor, block_size: int,
     # sanity check
     assert block_cu_seqlens[-1] == sum_seqlens
 
-    return req_cu_nblocks, block_cu_seqlens, block_req_idx, block_ntokens
+    return (req_cu_nblocks, block_cu_seqlens, block_req_idx, block_ntokens,
+            block_packed_cu_seqlens)
 
 
 def prepare_mamba2_metadata(
@@ -139,6 +152,7 @@ def prepare_mamba2_metadata(
     chunk_indices, chunk_offsets = None, None
     req_cu_nblocks, block_cu_seqlens, block_req_idx, block_ntokens = \
         None, None, None, None
+    block_packed_cu_seqlens = None
     # Need flags to indicate if there are initial states
     # currently we really only support the FlashAttention backend
     has_initial_states = None
@@ -171,7 +185,8 @@ def prepare_mamba2_metadata(
                 _query_start_loc_to_chunk_indices_offsets(
                 query_start_loc, chunk_size, num_prefill_tokens)
 
-        req_cu_nblocks, block_cu_seqlens, block_req_idx, block_ntokens = \
+        req_cu_nblocks, block_cu_seqlens, block_req_idx, \
+            block_ntokens, block_packed_cu_seqlens = \
             _get_block_ranges(query_start_loc, chunk_size, num_prefill_tokens)
 
     return Mamba2Metadata(has_initial_states=has_initial_states,
@@ -183,4 +198,7 @@ def prepare_mamba2_metadata(
                           req_cu_nblocks=req_cu_nblocks,
                           block_cu_seqlens=block_cu_seqlens,
                           block_req_idx=block_req_idx,
-                          block_ntokens=block_ntokens)
+                          block_ntokens=block_ntokens,
+                          block_packed_cu_seqlens=block_packed_cu_seqlens,
+                          packed_seqlen=block_packed_cu_seqlens[-1].item()
+                          if block_packed_cu_seqlens is not None else -1)

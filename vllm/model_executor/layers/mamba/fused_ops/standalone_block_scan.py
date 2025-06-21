@@ -48,6 +48,21 @@ except ImportError:
 #     ],
 #     key=[],
 # )
+# DEBUG: match best config of chunk_scan_fwd
+# @triton.autotune(  # best for non-tiled dstate
+#     configs=[
+#         triton.Config(
+#             {
+#                 'BLOCK_SIZE_T0': 32,
+#                 'BLOCK_SIZE_D': 64,
+#                 'BLOCK_SIZE_K': 32,
+#                 'USE_FAST_MATH': False,
+#             },
+#             num_warps=2,
+#             num_stages=5),  # effectively turns off sw pipelining
+#     ],
+#     key=[],
+# )
 @triton.autotune(  # best for non-tiled dstate
     configs=[
         triton.Config(
@@ -72,6 +87,7 @@ def block_scan_kernel(
     D_ptr,
     CB_ptr,
     block_cu_seqlens_ptr,
+    block_packed_cu_seqlens_ptr,
     prev_states_ptr,
     # Outputs
     output_ptr,
@@ -96,6 +112,7 @@ def block_scan_kernel(
     stride_CB_t0: tl.constexpr,
     stride_CB_t1: tl.constexpr,
     stride_block_cu_seqlens_n: tl.constexpr,
+    stride_block_packed_cu_seqlens_n: tl.constexpr,
     stride_prev_states_n: tl.constexpr,
     stride_prev_states_h: tl.constexpr,
     stride_prev_states_d: tl.constexpr,
@@ -109,6 +126,7 @@ def block_scan_kernel(
     BLOCK_SIZE_T0: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     USE_FAST_MATH: tl.constexpr,
+    ALIGN_BLOCKS: tl.constexpr,
 ):
     pid_n = tl.program_id(1)  # block idx
     pid_h = tl.program_id(2)  # head idx
@@ -123,20 +141,31 @@ def block_scan_kernel(
     t_start = tl.load(block_cu_seqlens_ptr + pid_n * stride_block_cu_seqlens_n)
     t_end = tl.load(block_cu_seqlens_ptr +
                     (pid_n + 1) * stride_block_cu_seqlens_n)
+
     ntokens = t_end - t_start
+    align_t_start, align_t_end = t_start, t_end
+    if ALIGN_BLOCKS:
+        align_t_start = tl.load(block_packed_cu_seqlens_ptr +
+                                pid_n * stride_block_packed_cu_seqlens_n)
+        align_t_end = tl.load(block_packed_cu_seqlens_ptr +
+                              (pid_n + 1) * stride_block_packed_cu_seqlens_n)
+        tl.multiple_of(align_t_start, 4)
+        tl.multiple_of(align_t_end, 4)
+    align_ntokens = align_t_end - align_t_start
 
     # Mask out-of-bound tokens
     mask_d = offs_d < headdim
 
     # Set base pointers
     dA_cumsum_ptr_h = dA_cumsum_ptr + pid_h * stride_dA_cumsum_h
-
     pid_g = pid_h // nheads_ngroups_ratio  # group idx
     t0_range = tl.arange(0, BLOCK_SIZE_T0)
     t0 = pid_t0 * BLOCK_SIZE_T0
     offs_t0_local = t0 + t0_range
     offs_t0_global = t_start + offs_t0_local
+    aligned_t0_global = align_t_start + offs_t0_local
     mask_t0 = offs_t0_local < ntokens
+    aligned_mask_t0 = offs_t0_local < align_ntokens
 
     # compute base pointers
     x_ptr_base = x_ptr + pid_h * stride_x_h
@@ -156,9 +185,12 @@ def block_scan_kernel(
     D = tl.load(D_ptr + pid_h * stride_D_h)
     acc = (x_t0 * D).to(tl.float32)
 
-    dA_cumsum_t0_ptrs = dA_cumsum_ptr_h + (offs_t0_global * stride_dA_cumsum_t
-                                           )  # (BLOCK_SIZE_T0,)
-    dA_cumsum_t0 = tl.load(dA_cumsum_t0_ptrs, mask=mask_t0, other=0.0)
+    dA_cumsum_t0_ptrs = dA_cumsum_ptr_h + (
+        aligned_t0_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_T0,)
+
+    # FIXME: These loads are 32-bit width not sure why
+    dA_cumsum_t0 = tl.load(dA_cumsum_t0_ptrs, mask=aligned_mask_t0, other=0.0)
+    dA_cumsum_t0 = tl.where(mask_t0, dA_cumsum_t0, 0.0)
 
     k_range = tl.arange(0, BLOCK_SIZE_K)
 
@@ -180,8 +212,12 @@ def block_scan_kernel(
         C = tl.load(C_ptrs,
                     mask=(mask_t0[:, None] & mask_s[None, :]),
                     other=0.0)
-        acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0[:, None])
-                )  #(BLOCK_SIZE_T0, BLOCK_SIZE_D)
+        if USE_FAST_MATH:
+            acc += mul_rn(tl.dot(C, prev_state.T),
+                          fast_expf(dA_cumsum_t0)[:, None])
+        else:
+            acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0)[:, None]
+                    )  #(BLOCK_SIZE_T0, BLOCK_SIZE_D)
     else:
         for ss in range(0, dstate, BLOCK_SIZE_K):
             offs_ss = ss + k_range
@@ -201,21 +237,31 @@ def block_scan_kernel(
             C = tl.load(C_ptrs,
                         mask=(mask_t0[:, None] & mask_ss[None, :]),
                         other=0.0)
-            acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0[:, None])
-                    )  #(BLOCK_SIZE_T0, BLOCK_SIZE_D)
+            if USE_FAST_MATH:
+                acc += mul_rn(tl.dot(C, prev_state.T),
+                              fast_expf(dA_cumsum_t0)[:, None])
+            else:
+                acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0)[:, None]
+                        )  #(BLOCK_SIZE_T0, BLOCK_SIZE_D)
 
     for t1 in range(0, ntokens, BLOCK_SIZE_K):
         mask_t1 = k_range < (ntokens - t1)  # (BLOCK_SIZE_K,)
         offs_t1_local = t1 + k_range
         offs_t1_global = t_start + offs_t1_local
+        aligned_t1_global = align_t_start + offs_t1_local
         mask_t1 = offs_t1_local < ntokens
+        aligned_mask_t1 = offs_t1_local < align_ntokens
 
         dA_cumsum_t1_ptrs = dA_cumsum_ptr_h + (
-            offs_t1_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_K,)
-        dt_t1_ptrs = dt_ptr_base + (offs_t1_global * stride_dt_t
+            aligned_t1_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_K,)
+        dt_t1_ptrs = dt_ptr_base + (aligned_t1_global * stride_dt_t
                                     )  # (BLOCK_SIZE_K,)
-        dt_t1 = tl.load(dt_t1_ptrs, mask=mask_t1, other=0.0)
-        dA_cumsum_t1 = tl.load(dA_cumsum_t1_ptrs, mask=mask_t1, other=0.0)
+        dt_t1 = tl.load(dt_t1_ptrs, mask=aligned_mask_t1, other=0.0)
+        dA_cumsum_t1 = tl.load(dA_cumsum_t1_ptrs,
+                               mask=aligned_mask_t1,
+                               other=0.0)
+        dt_t1 = tl.where(mask_t1, dt_t1, 0.0)
+        dA_cumsum_t1 = tl.where(mask_t1, dA_cumsum_t1, 0.0)
         x_t1_ptrs = x_ptr_base + (
             offs_t1_global[:, None] * stride_x_t + offs_d[None, :] * stride_x_d
         )  # (BLOCK_SIZE_K, BLOCK_SIZE_D)
@@ -256,15 +302,17 @@ def block_scan_kernel(
 # output:
 # output (seqlen, nheads, headdim)
 def block_scan(
-        x,  # (seqlen, nheads, headdim)
-        dt,  # (nheads, seqlen)
-        dA_cumsum,  # (nheads, seqlen)
-        prev_states,  # (nblocks, block_size, headdim, dstate)
-        C,  # (seqlen, ngroups, dstate)
-        D,
-        CB,  # (nblocks, ngroups, block_size, block_size)
-        # metadata
+    x,  # (seqlen, nheads, headdim)
+    dt,  # (nheads, seqlen)
+    dA_cumsum,  # (nheads, seqlen)
+    prev_states,  # (nblocks, block_size, headdim, dstate)
+    C,  # (seqlen, ngroups, dstate)
+    D,
+    CB,  # (nblocks, ngroups, block_size, block_size)
+    # metadata
     block_cu_seqlens,  # (nblocks+1,)
+    block_packed_cu_seqlens=None,  # (nblocks+1,)
+    align_blocks=False,
 ):
     seqlen, nheads, headdim = x.shape
     ngroups = C.shape[1]
@@ -272,13 +320,17 @@ def block_scan(
     block_size = CB.shape[-1]
     nblocks = prev_states.shape[0]
 
-    assert dt.shape == (nheads, seqlen)
-    assert dA_cumsum.shape == (nheads, seqlen)
+    aligned_seqlen = dt.shape[-1] if align_blocks else seqlen
+
+    assert dt.shape == (nheads, aligned_seqlen)
+    assert dA_cumsum.shape == (nheads, aligned_seqlen)
     assert C.shape == (seqlen, ngroups, dstate)
     assert D.shape == (nheads, )
     assert CB.shape == (nblocks, ngroups, block_size, block_size)
     assert prev_states.shape == (nblocks, nheads, headdim, dstate)
     assert block_cu_seqlens.shape == (nblocks + 1, )
+    if align_blocks:
+        assert block_packed_cu_seqlens.shape == block_cu_seqlens.shape
 
     # Allocate outputs
     output = torch.empty_like(x)
@@ -297,6 +349,7 @@ def block_scan(
             D_ptr=D,
             CB_ptr=CB,
             block_cu_seqlens_ptr=block_cu_seqlens,
+            block_packed_cu_seqlens_ptr=block_packed_cu_seqlens,
             prev_states_ptr=prev_states,
             output_ptr=output,
             headdim=headdim,
@@ -318,6 +371,8 @@ def block_scan(
             stride_CB_t0=CB.stride(2),
             stride_CB_t1=CB.stride(3),
             stride_block_cu_seqlens_n=block_cu_seqlens.stride(0),
+            stride_block_packed_cu_seqlens_n=(block_packed_cu_seqlens.stride(0)
+                                              if align_blocks else 0),
             stride_prev_states_n=prev_states.stride(0),
             stride_prev_states_h=prev_states.stride(1),
             stride_prev_states_d=prev_states.stride(2),
@@ -326,6 +381,7 @@ def block_scan(
             stride_output_h=output.stride(1),
             stride_output_d=output.stride(2),
             BLOCK_SIZE_S=max(dstate, 16),
+            ALIGN_BLOCKS=align_blocks,
         )
 
     return output

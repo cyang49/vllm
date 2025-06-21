@@ -35,12 +35,20 @@ from vllm.triton_utils import tl, triton
 # )
 @triton.autotune(
     configs=[
-        triton.Config({
-            'BLOCK_SIZE_D': 16,
-            'BLOCK_SIZE_S': 64,
-        },
-                      num_warps=4,
-                      num_stages=5),
+        triton.Config(
+            {
+                'BLOCK_SIZE_D': 16,  # best
+                'BLOCK_SIZE_S': 64,
+            },
+            num_warps=4,
+            num_stages=5),
+        triton.Config(
+            {
+                'BLOCK_SIZE_D': 32,  # best for non aligned?
+                'BLOCK_SIZE_S': 64,
+            },
+            num_warps=4,
+            num_stages=5),
     ],
     key=[],
 )
@@ -51,6 +59,7 @@ def state_passing_kernel(
     block_states_ptr,
     init_states_ptr,
     block_cu_seqlens_ptr,
+    block_packed_cu_seqlens_ptr,
     block_req_idx_ptr,
     req_cu_nblocks_ptr,
     # Outputs
@@ -72,6 +81,7 @@ def state_passing_kernel(
     stride_init_states_d: tl.constexpr,
     stride_init_states_s: tl.constexpr,
     stride_block_cu_seqlens_n: tl.constexpr,
+    stride_block_packed_cu_seqlens_n: tl.constexpr,
     stride_block_req_idx_n: tl.constexpr,
     stride_req_cu_nblocks_b: tl.constexpr,
     stride_prev_states_n: tl.constexpr,
@@ -86,6 +96,7 @@ def state_passing_kernel(
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_S: tl.constexpr,
     IS_STORE_PREV_STATES: tl.constexpr,
+    ALIGN_BLOCKS: tl.constexpr,
 ):
     pid_h = tl.program_id(2)  # head idx
     pid_d = tl.program_id(0)
@@ -133,10 +144,20 @@ def state_passing_kernel(
                      mask=(mask_d[:, None] & mask_s[None, :]))
 
         # update state
+        t_start = tl.load(block_cu_seqlens_ptr + n * stride_block_cu_seqlens_n)
         t_end = tl.load(block_cu_seqlens_ptr +
                         (n + 1) * stride_block_cu_seqlens_n)
-        dA_cumsum_last = tl.load(dA_cumsum_ptr_base +
-                                 (t_end - 1) * stride_dA_cumsum_t)  # scalar
+        ntokens = t_end - t_start
+        align_t_start = t_start
+        if ALIGN_BLOCKS:
+            align_t_start = tl.load(block_packed_cu_seqlens_ptr +
+                                    n * stride_block_packed_cu_seqlens_n)
+            align_t_start = tl.multiple_of(
+                align_t_start, 4)  # not sure if the hint works in if block
+
+        dA_cumsum_last = tl.load(
+            dA_cumsum_ptr_base +
+            (align_t_start + ntokens - 1) * stride_dA_cumsum_t)  # scalar
         block_decay = tl.exp(dA_cumsum_last)
 
         state = tl.load(block_states_ptrs + n * stride_block_states_n,
@@ -166,26 +187,32 @@ def state_passing(
     block_cu_seqlens,  # (nblocks+1,)
     block_req_idx,  # (nblocks, )
     req_cu_nblocks,  # (batch+1, )
+    block_packed_cu_seqlens=None,  # (nblocks+1,)
     return_prev_states=True,
+    align_blocks=False,
+    out_dtype=None,
 ):
 
     nheads, _ = dA_cumsum.shape
     nblocks, _, headdim, dstate = block_states.shape
     batch = initial_states.shape[0]
 
-    # assert block_states.shape == (nblocks, nheads, headdim, dstate)
+    assert block_states.shape == (nblocks, nheads, headdim, dstate)
     assert initial_states.shape == (batch, nheads, headdim, dstate)
     assert block_cu_seqlens.shape == (nblocks + 1, )
     assert block_req_idx.shape == (nblocks, )
     assert req_cu_nblocks.shape == (batch + 1, )
+    if align_blocks:
+        assert block_packed_cu_seqlens.shape == block_cu_seqlens.shape
 
     device = dA_cumsum.device
 
     # Allocate outputs
-    prev_states = (torch.empty_like(block_states)
+    out_dtype = block_states.dtype if out_dtype is None else out_dtype
+    prev_states = (torch.empty_like(block_states, dtype=out_dtype)
                    if return_prev_states else None)
     final_states = torch.empty((batch, nheads, headdim, dstate),
-                               dtype=block_states.dtype,
+                               dtype=out_dtype,
                                device=device)
     prev_state_strides = ((0, 0, 0, 0) if prev_states is None else
                           (prev_states.stride(0), prev_states.stride(1),
@@ -201,6 +228,7 @@ def state_passing(
             block_states_ptr=block_states,
             init_states_ptr=initial_states,
             block_cu_seqlens_ptr=block_cu_seqlens,
+            block_packed_cu_seqlens_ptr=block_packed_cu_seqlens,
             block_req_idx_ptr=block_req_idx,
             req_cu_nblocks_ptr=req_cu_nblocks,
             prev_states_ptr=prev_states,
@@ -219,6 +247,8 @@ def state_passing(
             stride_init_states_d=initial_states.stride(2),
             stride_init_states_s=initial_states.stride(3),
             stride_block_cu_seqlens_n=block_cu_seqlens.stride(0),
+            stride_block_packed_cu_seqlens_n=(block_packed_cu_seqlens.stride(0)
+                                              if align_blocks else 0),
             stride_block_req_idx_n=block_req_idx.stride(0),
             stride_req_cu_nblocks_b=req_cu_nblocks.stride(0),
             stride_prev_states_n=prev_state_strides[0],
@@ -230,6 +260,7 @@ def state_passing(
             stride_final_states_d=final_states.stride(2),
             stride_final_states_s=final_states.stride(3),
             IS_STORE_PREV_STATES=return_prev_states,
+            ALIGN_BLOCKS=align_blocks,
         )
 
     return final_states, prev_states
