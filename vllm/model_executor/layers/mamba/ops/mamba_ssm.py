@@ -37,6 +37,24 @@ else:
 })
 @triton.heuristics(
     {"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
+# @triton.autotune(
+#     configs=generate_autotune_combinations(
+#         spec={'BLOCK_SIZE_M': [4, 8, 16, 32, 64], # headdim
+#               'num_warps': [2, 4],
+#               'num_stages': [3],
+#              },
+#         ),
+#     key=[],
+# )
+# @triton.autotune(
+#     configs=generate_autotune_combinations( # BEST H100 bs=256,128
+#         spec={'BLOCK_SIZE_M': [16,], # headdim
+#               'num_warps': [2,],
+#               'num_stages': [3],
+#              },
+#         ),
+#     key=[],
+# )
 @triton.jit
 def _selective_scan_update_kernel(
     # Pointers to matrices
@@ -269,10 +287,13 @@ def selective_state_update(state,
                  (0, 0, 0))
     # We don't want autotune since it will overwrite the state
     # We instead tune by hand.
-    BLOCK_SIZE_M, num_warps = ((32, 4) if dstate <= 16 else
-                               ((16, 4) if dstate <= 32 else
-                                ((8, 4) if dstate <= 64 else
-                                 ((4, 4) if dstate <= 128 else ((4, 8))))))
+    # BLOCK_SIZE_M, num_warps = ((32, 4) if dstate <= 16 else
+    #                            ((16, 4) if dstate <= 32 else
+    #                             ((8, 4) if dstate <= 64 else
+    #                              ((4, 4) if dstate <= 128 else ((4, 8))))))
+    # FIXME: This is for Bamba on H100 specifically. Need to add better logic
+    #        for portability to different GPU and models
+    BLOCK_SIZE_M, num_warps = ((16, 2) if batch > 64 else (16, 4))
     tie_hdim = A.stride(-1) == 0 and A.stride(-2) == 0 and dt.stride(
         -1) == 0 and dt_bias.stride(-1) == 0
     with torch.cuda.device(x.device.index):
