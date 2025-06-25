@@ -13,10 +13,10 @@ from vllm.triton_utils import tl, triton
 #         spec={'BLOCK_SIZE_TT': [32, 64, 128],
 #               'BLOCK_SIZE_D': [32, 64, 128],
 #               'BLOCK_SIZE_S': [32, 64],
-#               'BLOCK_SIZE_T0': [16],
-#               'BLOCK_SIZE_T1': [16],
+#               'BLOCK_SIZE_T0': [16, 32, 64],
+#               'BLOCK_SIZE_T1': [16, 32, 64],
 #               'num_warps': [2, 4],
-#               'num_stages': [1, 2, 3, 4, 5],
+#               'num_stages': [1, 2, 3,],
 #              },
 #         ),
 #     key=[],
@@ -35,16 +35,6 @@ from vllm.triton_utils import tl, triton
             },
             num_warps=2,
             num_stages=3),
-        # triton.Config(
-        #     {
-        #         'BLOCK_SIZE_TT': 128,
-        #         'BLOCK_SIZE_D': 64,
-        #         'BLOCK_SIZE_S': 64,
-        #         'BLOCK_SIZE_T0': 16,
-        #         'BLOCK_SIZE_T1': 16,
-        #     },
-        #     num_warps=4,
-        #     num_stages=3),
     ],
     key=[],
 )
@@ -117,16 +107,18 @@ def fused_block_state_bmm_kernel(
 
     # Load block start and end offset
     t_start = tl.load(block_cu_seqlens_ptr + pid_n * stride_block_cu_seqlens_n)
-    align_t_start = t_start
-    if ALIGN_BLOCKS:
-        align_t_start = tl.load(block_packed_cu_seqlens_ptr +
-                                pid_n * stride_block_packed_cu_seqlens_n)
-        align_t_start = tl.multiple_of(
-            align_t_start, 4)  # not sure if the hint works in if block
-
     t_end = tl.load(block_cu_seqlens_ptr +
                     (pid_n + 1) * stride_block_cu_seqlens_n)
     ntokens = t_end - t_start  # number of tokens in this block
+    align_t_start, align_t_end = t_start, t_end
+    if ALIGN_BLOCKS:
+        align_t_start = tl.load(block_packed_cu_seqlens_ptr +
+                                pid_n * stride_block_packed_cu_seqlens_n)
+        align_t_end = tl.load(block_packed_cu_seqlens_ptr +
+                              (pid_n + 1) * stride_block_packed_cu_seqlens_n)
+        tl.multiple_of(align_t_start, 4)
+        tl.multiple_of(align_t_end, 4)
+    align_ntokens = align_t_end - align_t_start
 
     # Mask out-of-bound tokens
     mask_d = offs_d < headdim
@@ -147,6 +139,7 @@ def fused_block_state_bmm_kernel(
     # In a for loop, process tokens within the length bound (ntokens)
     for tt in range(0, ntokens, BLOCK_SIZE_TT):
         mask_tt = offs_tt < (ntokens - tt)
+        aligned_mask_tt = offs_tt < (align_ntokens - tt)
         x_ptr_tt = x_ptr_base + tt * stride_x_t
         dt_ptr_tt = dt_ptr_base + tt * stride_dt_t
         dA_cumsum_ptr_tt = dA_cumsum_ptr_base + tt * stride_dA_cumsum_t
@@ -158,9 +151,12 @@ def fused_block_state_bmm_kernel(
             None, :] * stride_B_s  # (BLOCK_SIZE_TT, dstate)
         dt_ptrs = dt_ptr_tt + offs_tt * stride_dt_t  # (BLOCK_SIZE_TT,)
         dA_cumsum_ptrs = dA_cumsum_ptr_tt + offs_tt * stride_dA_cumsum_t  # (BLOCK_SIZE_TT,)
-
-        dt = tl.load(dt_ptrs, mask=mask_tt, other=0.0)
-        dA_cs = tl.load(dA_cumsum_ptrs, mask=mask_tt, other=0.0)
+        dt = tl.where(mask_tt, tl.load(dt_ptrs,
+                                       mask=aligned_mask_tt,
+                                       other=0.0), 0.0)
+        dA_cs = tl.where(
+            mask_tt, tl.load(dA_cumsum_ptrs, mask=aligned_mask_tt, other=0.0),
+            0.0)
         x_tt = tl.load(x_ptrs,
                        mask=(mask_d[:, None] & mask_tt[None, :]),
                        other=0.0)
@@ -192,16 +188,23 @@ def fused_block_state_bmm_kernel(
         # work of 1 group among (nheads_ngroups_ratio x ndsblocks) programs
         # TODO: add assertions for sanity check
         ndsblocks = tl.num_programs(0)
-        # ntcblocks = tl.cdiv(block_size, BLOCK_SIZE_T0)
+        ntcblocks = tl.cdiv(block_size, BLOCK_SIZE_T0)
         ntbblocks = tl.cdiv(block_size, BLOCK_SIZE_T1)
         # assert (ndsblocks *
         #         nheads_ngroups_ratio) == (ntcblocks *
         #                                   ntbblocks), "parallelism check"
 
         # map from (nheads, ndsblocks) to index space of (ngroups, ntcblocks, ntbblocks)
-        flat_idx = (
-            (pid_h % nheads_ngroups_ratio)  # get group local head index
-            * ndsblocks + pid_ds)
+        nheads = tl.num_programs(2)
+        ngroups = nheads // nheads_ngroups_ratio
+        num_total_programs = (nheads * ndsblocks)
+        ratio = num_total_programs // (ngroups * ntcblocks * ntbblocks)
+
+        # skip no task assigned
+        if num_total_programs % ratio != 0:
+            return
+
+        flat_idx = (pid_h * ndsblocks + pid_ds) // ratio
         t0_bidx = flat_idx // ntbblocks
         t1_bidx = flat_idx % ntbblocks
 
