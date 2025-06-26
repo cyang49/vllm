@@ -11,6 +11,8 @@ try:
 except ImportError:
     from triton.language.math import add_rn, fast_expf, mul_rn
 
+from .utils import load_t_offsets, load_with_aligned_mask
+
 # Notations for readability
 #   - b: batch
 #   - h: nheads
@@ -29,38 +31,11 @@ except ImportError:
 #         'BLOCK_SIZE_D': [16, 32, 64],
 #         'BLOCK_SIZE_T0': [16, 32, 64],
 #         'BLOCK_SIZE_K': [16, 32, 64],
-#         'USE_FAST_MATH': [True, False],
+#         'USE_FAST_MATH': [True],
+#         'ALIGN_MASK': [False, True],
 #         'num_warps': [2, 4],
-#         'num_stages': [1, 2, 3, 4],
+#         'num_stages': [1, 2, 3],
 #     }, ),
-#     key=[],
-# )
-# @triton.autotune(  # best for tiled dstate
-#     configs=[
-#         triton.Config(
-#             {
-#                 'BLOCK_SIZE_D': 64,
-#                 'BLOCK_SIZE_T0': 64,
-#                 'BLOCK_SIZE_K': 64,
-#             },
-#             num_warps=4,
-#             num_stages=1),
-#     ],
-#     key=[],
-# )
-# DEBUG: match best config of chunk_scan_fwd
-# @triton.autotune(  # best for non-tiled dstate
-#     configs=[
-#         triton.Config(
-#             {
-#                 'BLOCK_SIZE_T0': 32,
-#                 'BLOCK_SIZE_D': 64,
-#                 'BLOCK_SIZE_K': 32,
-#                 'USE_FAST_MATH': False,
-#             },
-#             num_warps=2,
-#             num_stages=5),  # effectively turns off sw pipelining
-#     ],
 #     key=[],
 # )
 @triton.autotune(  # best for non-tiled dstate
@@ -71,6 +46,7 @@ except ImportError:
                 'BLOCK_SIZE_T0': 64,
                 'BLOCK_SIZE_K': 32,
                 'USE_FAST_MATH': True,
+                'ALIGN_MASK': True,
             },
             num_warps=4,
             num_stages=1),  # effectively turns off sw pipelining
@@ -79,57 +55,60 @@ except ImportError:
 )
 @triton.jit
 def block_scan_kernel(
-    # Inputs
-    x_ptr,
-    dt_ptr,
-    dA_cumsum_ptr,
-    C_ptr,
-    D_ptr,
-    CB_ptr,
-    block_cu_seqlens_ptr,
-    block_packed_cu_seqlens_ptr,
-    prev_states_ptr,
-    # Outputs
-    output_ptr,
-    # Matrix dimensions
-    headdim: tl.constexpr,
-    dstate: tl.constexpr,
-    nheads_ngroups_ratio: tl.constexpr,
-    # Strides
-    stride_x_t: tl.constexpr,
-    stride_x_h: tl.constexpr,
-    stride_x_d: tl.constexpr,
-    stride_dt_h,
-    stride_dt_t: tl.constexpr,
-    stride_dA_cumsum_h,
-    stride_dA_cumsum_t: tl.constexpr,
-    stride_C_t: tl.constexpr,
-    stride_C_g: tl.constexpr,
-    stride_C_s: tl.constexpr,
-    stride_D_h: tl.constexpr,
-    stride_CB_n: tl.constexpr,
-    stride_CB_g: tl.constexpr,
-    stride_CB_t0: tl.constexpr,
-    stride_CB_t1: tl.constexpr,
-    stride_block_cu_seqlens_n: tl.constexpr,
-    stride_block_packed_cu_seqlens_n: tl.constexpr,
-    stride_prev_states_n: tl.constexpr,
-    stride_prev_states_h: tl.constexpr,
-    stride_prev_states_d: tl.constexpr,
-    stride_prev_states_s: tl.constexpr,
-    stride_output_t: tl.constexpr,
-    stride_output_h: tl.constexpr,
-    stride_output_d: tl.constexpr,
-    # Meta-parameters
-    BLOCK_SIZE_D: tl.constexpr,
-    BLOCK_SIZE_S: tl.constexpr,
-    BLOCK_SIZE_T0: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    USE_FAST_MATH: tl.constexpr,
-    ALIGN_BLOCKS: tl.constexpr,
+        # Inputs
+        x_ptr,
+        dt_ptr,
+        dA_cumsum_ptr,
+        C_ptr,
+        D_ptr,
+        CB_ptr,
+        block_cu_seqlens_ptr,
+        block_packed_cu_seqlens_ptr,
+        prev_states_ptr,
+        # Outputs
+        output_ptr,
+        # Matrix dimensions
+        headdim: tl.constexpr,
+        dstate: tl.constexpr,
+        nheads_ngroups_ratio: tl.constexpr,
+        # Strides
+        stride_x_t: tl.constexpr,
+        stride_x_h: tl.constexpr,
+        stride_x_d: tl.constexpr,
+        stride_dt_h,
+        stride_dt_t: tl.constexpr,
+        stride_dA_cumsum_h,
+        stride_dA_cumsum_t: tl.constexpr,
+        stride_C_t: tl.constexpr,
+        stride_C_g: tl.constexpr,
+        stride_C_s: tl.constexpr,
+        stride_D_h: tl.constexpr,
+        stride_CB_n: tl.constexpr,
+        stride_CB_g: tl.constexpr,
+        stride_CB_t0: tl.constexpr,
+        stride_CB_t1: tl.constexpr,
+        stride_block_cu_seqlens_n: tl.constexpr,
+        stride_block_packed_cu_seqlens_n: tl.constexpr,
+        stride_prev_states_n: tl.constexpr,
+        stride_prev_states_h: tl.constexpr,
+        stride_prev_states_d: tl.constexpr,
+        stride_prev_states_s: tl.constexpr,
+        stride_output_t: tl.constexpr,
+        stride_output_h: tl.constexpr,
+        stride_output_d: tl.constexpr,
+        # Meta-parameters
+        BLOCK_SIZE_D: tl.constexpr,
+        BLOCK_SIZE_S: tl.constexpr,
+        BLOCK_SIZE_T0: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr,
+        USE_FAST_MATH: tl.constexpr,
+        ALIGN_BLOCKS: tl.constexpr,  # Aligned input tensor blocks
+        ALIGN_MASK: tl.constexpr,  # Use aligned mask in tl.load
 ):
+    tl.static_assert((ALIGN_MASK and ALIGN_BLOCKS) or not ALIGN_MASK)
     pid_n = tl.program_id(1)  # block idx
     pid_h = tl.program_id(2)  # head idx
+    pid_g = pid_h // nheads_ngroups_ratio  # group idx
     ndblocks = tl.cdiv(headdim, BLOCK_SIZE_D)
     pid_t0 = tl.program_id(0) // ndblocks
     pid_d = tl.program_id(0) % ndblocks
@@ -138,32 +117,26 @@ def block_scan_kernel(
 
     # Load metadata
     # start and end token index in seqlen dimension
-    t_start = tl.load(block_cu_seqlens_ptr + pid_n * stride_block_cu_seqlens_n)
-    t_end = tl.load(block_cu_seqlens_ptr +
-                    (pid_n + 1) * stride_block_cu_seqlens_n)
-
-    ntokens = t_end - t_start
-    align_t_start, align_t_end = t_start, t_end
-    if ALIGN_BLOCKS:
-        align_t_start = tl.load(block_packed_cu_seqlens_ptr +
-                                pid_n * stride_block_packed_cu_seqlens_n)
-        align_t_end = tl.load(block_packed_cu_seqlens_ptr +
-                              (pid_n + 1) * stride_block_packed_cu_seqlens_n)
-        tl.multiple_of(align_t_start, 4)
-        tl.multiple_of(align_t_end, 4)
-    align_ntokens = align_t_end - align_t_start
+    t_start, _, ntokens = load_t_offsets(pid_n, block_cu_seqlens_ptr,
+                                         stride_block_cu_seqlens_n)
+    align_t_start, _, align_ntokens = load_t_offsets(
+        pid_n,
+        block_packed_cu_seqlens_ptr,
+        stride_block_packed_cu_seqlens_n,
+        ALIGNED=ALIGN_BLOCKS,
+        PACK_SIZE=4)
 
     # Mask out-of-bound tokens
     mask_d = offs_d < headdim
 
     # Set base pointers
     dA_cumsum_ptr_h = dA_cumsum_ptr + pid_h * stride_dA_cumsum_h
-    pid_g = pid_h // nheads_ngroups_ratio  # group idx
-    t0_range = tl.arange(0, BLOCK_SIZE_T0)
+
     t0 = pid_t0 * BLOCK_SIZE_T0
-    offs_t0_local = t0 + t0_range
+    offs_t0_local = t0 + tl.arange(0, BLOCK_SIZE_T0)
     offs_t0_global = t_start + offs_t0_local
     aligned_t0_global = align_t_start + offs_t0_local
+
     mask_t0 = offs_t0_local < ntokens
     aligned_mask_t0 = offs_t0_local < align_ntokens
 
@@ -173,7 +146,9 @@ def block_scan_kernel(
     CB_ptr_base = CB_ptr + pid_n * stride_CB_n + pid_g * stride_CB_g
     C_ptr_base = C_ptr + pid_g * stride_C_g
     output_ptr_base = output_ptr + pid_h * stride_output_h
-    prev_states_ptr_base = prev_states_ptr + pid_n * stride_prev_states_n + pid_h * stride_prev_states_h
+    prev_states_ptr_base = prev_states_ptr + \
+                           pid_n * stride_prev_states_n + \
+                           pid_h * stride_prev_states_h
 
     # 2. compute output
     x_t0_ptrs = x_ptr_base + (
@@ -182,15 +157,17 @@ def block_scan_kernel(
     x_t0 = tl.load(x_t0_ptrs,
                    mask=(mask_t0[:, None] & mask_d[None, :]),
                    other=0.0)
+
+    # 2.1 xD term
     D = tl.load(D_ptr + pid_h * stride_D_h)
     acc = (x_t0 * D).to(tl.float32)
 
     dA_cumsum_t0_ptrs = dA_cumsum_ptr_h + (
         aligned_t0_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_T0,)
-
-    # FIXME: These loads are 32-bit width not sure why
-    dA_cumsum_t0 = tl.load(dA_cumsum_t0_ptrs, mask=aligned_mask_t0, other=0.0)
-    dA_cumsum_t0 = tl.where(mask_t0, dA_cumsum_t0, 0.0)
+    dA_cumsum_t0 = load_with_aligned_mask(dA_cumsum_t0_ptrs,
+                                          mask_t0,
+                                          aligned_mask_t0,
+                                          ALIGN_MASK=ALIGN_MASK)
 
     k_range = tl.arange(0, BLOCK_SIZE_K)
 
@@ -244,6 +221,7 @@ def block_scan_kernel(
                 acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0)[:, None]
                         )  #(BLOCK_SIZE_T0, BLOCK_SIZE_D)
 
+    # 2.3 compute diagonal output contribution
     for t1 in range(0, ntokens, BLOCK_SIZE_K):
         mask_t1 = k_range < (ntokens - t1)  # (BLOCK_SIZE_K,)
         offs_t1_local = t1 + k_range
@@ -256,12 +234,16 @@ def block_scan_kernel(
             aligned_t1_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_K,)
         dt_t1_ptrs = dt_ptr_base + (aligned_t1_global * stride_dt_t
                                     )  # (BLOCK_SIZE_K,)
-        dt_t1 = tl.load(dt_t1_ptrs, mask=aligned_mask_t1, other=0.0)
-        dA_cumsum_t1 = tl.load(dA_cumsum_t1_ptrs,
-                               mask=aligned_mask_t1,
-                               other=0.0)
-        dt_t1 = tl.where(mask_t1, dt_t1, 0.0)
-        dA_cumsum_t1 = tl.where(mask_t1, dA_cumsum_t1, 0.0)
+
+        dt_t1 = load_with_aligned_mask(dt_t1_ptrs,
+                                       mask_t1,
+                                       aligned_mask_t1,
+                                       ALIGN_MASK=ALIGN_MASK)
+        dA_cumsum_t1 = load_with_aligned_mask(dA_cumsum_t1_ptrs,
+                                              mask_t1,
+                                              aligned_mask_t1,
+                                              ALIGN_MASK=ALIGN_MASK)
+
         x_t1_ptrs = x_ptr_base + (
             offs_t1_global[:, None] * stride_x_t + offs_d[None, :] * stride_x_d
         )  # (BLOCK_SIZE_K, BLOCK_SIZE_D)
@@ -272,8 +254,7 @@ def block_scan_kernel(
                                  offs_t1_local[None, :] * stride_CB_t1
                                  )  # (BLOCK_SIZE_T0, BLOCK_SIZE_K)
 
-        # 2.1 compute diagonal output contribution
-        # ok to not mask - causal mask applied later
+        # ok to not use load mask - causal mask applied later
         CB = tl.load(CB_ptrs)
 
         causal_mask = offs_t0_local[:, None] >= offs_t1_local[None, :]

@@ -6,6 +6,8 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+from .utils import load_t_offsets, load_with_aligned_mask
+
 
 # from .utils import generate_autotune_combinations
 # @triton.autotune(
@@ -15,6 +17,7 @@ from vllm.triton_utils import tl, triton
 #               'BLOCK_SIZE_S': [32, 64],
 #               'BLOCK_SIZE_T0': [16, 32, 64],
 #               'BLOCK_SIZE_T1': [16, 32, 64],
+#               'ALIGN_MASK': [False, True],
 #               'num_warps': [2, 4],
 #               'num_stages': [1, 2, 3,],
 #              },
@@ -22,9 +25,20 @@ from vllm.triton_utils import tl, triton
 #     key=[],
 # )
 #Triton autotuning for function fused_block_state_bmm_kernel finished after 126.16s; best config selected: BLOCK_SIZE_TT: 64, BLOCK_SIZE_D: 64, BLOCK_SIZE_S: 64, BLOCK_SIZE_T0: 16, BLOCK_SIZE_T1: 16, num_warps: 2, num_ctas: 1, num_stages: 3, num_buffers_warp_spec: 0, num_consumer_groups: 0, reg_dec_producer: 0, reg_inc_consumer: 0, maxnreg: None;
-# Best found on H100 # fused
+# Best found on H100
 @triton.autotune(
     configs=[
+        # triton.Config(
+        #     {
+        #         'BLOCK_SIZE_TT': 64,
+        #         'BLOCK_SIZE_D': 64,
+        #         'BLOCK_SIZE_S': 64,
+        #         'BLOCK_SIZE_T0': 16,
+        #         'BLOCK_SIZE_T1': 16,
+        #         'ALIGN_MASK': True,
+        #     },
+        #     num_warps=2,
+        #     num_stages=3),
         triton.Config(
             {
                 'BLOCK_SIZE_TT': 64,
@@ -32,6 +46,7 @@ from vllm.triton_utils import tl, triton
                 'BLOCK_SIZE_S': 64,
                 'BLOCK_SIZE_T0': 16,
                 'BLOCK_SIZE_T1': 16,
+                'ALIGN_MASK': False,
             },
             num_warps=2,
             num_stages=3),
@@ -82,7 +97,8 @@ def fused_block_state_bmm_kernel(
     stride_CB_t1: tl.constexpr,
     # Meta-parameters
     FUSED_COMPUTE_CB: tl.constexpr,
-    ALIGN_BLOCKS: tl.constexpr,
+    ALIGN_BLOCKS: tl.constexpr,  # Aligned input tensor blocks
+    ALIGN_MASK: tl.constexpr,  # Use aligned mask in tl.load
     # finer grain decomposition of block size dimension
     BLOCK_SIZE_TT: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
@@ -90,6 +106,7 @@ def fused_block_state_bmm_kernel(
     BLOCK_SIZE_T0: tl.constexpr,
     BLOCK_SIZE_T1: tl.constexpr,
 ):
+    tl.static_assert((ALIGN_MASK and ALIGN_BLOCKS) or not ALIGN_MASK)
     tl.static_assert(dstate >= BLOCK_SIZE_S)
     pid_ds = tl.program_id(0)
     nsblocks = tl.cdiv(dstate, BLOCK_SIZE_S)
@@ -106,19 +123,14 @@ def fused_block_state_bmm_kernel(
     offs_s = pid_s * BLOCK_SIZE_S + tl.arange(0, BLOCK_SIZE_S)
 
     # Load block start and end offset
-    t_start = tl.load(block_cu_seqlens_ptr + pid_n * stride_block_cu_seqlens_n)
-    t_end = tl.load(block_cu_seqlens_ptr +
-                    (pid_n + 1) * stride_block_cu_seqlens_n)
-    ntokens = t_end - t_start  # number of tokens in this block
-    align_t_start, align_t_end = t_start, t_end
-    if ALIGN_BLOCKS:
-        align_t_start = tl.load(block_packed_cu_seqlens_ptr +
-                                pid_n * stride_block_packed_cu_seqlens_n)
-        align_t_end = tl.load(block_packed_cu_seqlens_ptr +
-                              (pid_n + 1) * stride_block_packed_cu_seqlens_n)
-        tl.multiple_of(align_t_start, 4)
-        tl.multiple_of(align_t_end, 4)
-    align_ntokens = align_t_end - align_t_start
+    t_start, _, ntokens = load_t_offsets(pid_n, block_cu_seqlens_ptr,
+                                         stride_block_cu_seqlens_n)
+    align_t_start, _, align_ntokens = load_t_offsets(
+        pid_n,
+        block_packed_cu_seqlens_ptr,
+        stride_block_packed_cu_seqlens_n,
+        ALIGNED=ALIGN_BLOCKS,
+        PACK_SIZE=4)
 
     # Mask out-of-bound tokens
     mask_d = offs_d < headdim
@@ -126,9 +138,10 @@ def fused_block_state_bmm_kernel(
 
     # Compute base pointer addresses
     x_ptr_base = x_ptr + t_start * stride_x_t + pid_h * stride_x_h
-    dt_ptr_base = dt_ptr + align_t_start * stride_dt_t + pid_h * stride_dt_h
-    dA_cumsum_ptr_base = dA_cumsum_ptr + align_t_start * stride_dA_cumsum_t + pid_h * stride_dA_cumsum_h
     B_ptr_base = B_ptr + t_start * stride_B_t + pid_g * stride_B_g
+    dt_ptr_base = dt_ptr + align_t_start * stride_dt_t + pid_h * stride_dt_h
+    dA_cumsum_ptr_base = dA_cumsum_ptr + \
+        align_t_start * stride_dA_cumsum_t + pid_h * stride_dA_cumsum_h
 
     # Load last element value from dA_cumsum block
     dA_cs_last = tl.load(dA_cumsum_ptr_base +
@@ -140,6 +153,7 @@ def fused_block_state_bmm_kernel(
     for tt in range(0, ntokens, BLOCK_SIZE_TT):
         mask_tt = offs_tt < (ntokens - tt)
         aligned_mask_tt = offs_tt < (align_ntokens - tt)
+
         x_ptr_tt = x_ptr_base + tt * stride_x_t
         dt_ptr_tt = dt_ptr_base + tt * stride_dt_t
         dA_cumsum_ptr_tt = dA_cumsum_ptr_base + tt * stride_dA_cumsum_t
@@ -151,12 +165,16 @@ def fused_block_state_bmm_kernel(
             None, :] * stride_B_s  # (BLOCK_SIZE_TT, dstate)
         dt_ptrs = dt_ptr_tt + offs_tt * stride_dt_t  # (BLOCK_SIZE_TT,)
         dA_cumsum_ptrs = dA_cumsum_ptr_tt + offs_tt * stride_dA_cumsum_t  # (BLOCK_SIZE_TT,)
-        dt = tl.where(mask_tt, tl.load(dt_ptrs,
-                                       mask=aligned_mask_tt,
-                                       other=0.0), 0.0)
-        dA_cs = tl.where(
-            mask_tt, tl.load(dA_cumsum_ptrs, mask=aligned_mask_tt, other=0.0),
-            0.0)
+
+        dt = load_with_aligned_mask(dt_ptrs,
+                                    mask_tt,
+                                    aligned_mask_tt,
+                                    ALIGN_MASK=ALIGN_MASK)
+        dA_cs = load_with_aligned_mask(dA_cumsum_ptrs,
+                                       mask_tt,
+                                       aligned_mask_tt,
+                                       ALIGN_MASK=ALIGN_MASK)
+
         x_tt = tl.load(x_ptrs,
                        mask=(mask_d[:, None] & mask_tt[None, :]),
                        other=0.0)
@@ -186,13 +204,9 @@ def fused_block_state_bmm_kernel(
         # (nblocks × ngroups) of square matrices (block_size × block_size).
         # Here we use 2d output decomposition on CB submatrix and distribute
         # work of 1 group among (nheads_ngroups_ratio x ndsblocks) programs
-        # TODO: add assertions for sanity check
         ndsblocks = tl.num_programs(0)
         ntcblocks = tl.cdiv(block_size, BLOCK_SIZE_T0)
         ntbblocks = tl.cdiv(block_size, BLOCK_SIZE_T1)
-        # assert (ndsblocks *
-        #         nheads_ngroups_ratio) == (ntcblocks *
-        #                                   ntbblocks), "parallelism check"
 
         # map from (nheads, ndsblocks) to index space of (ngroups, ntcblocks, ntbblocks)
         nheads = tl.num_programs(2)
@@ -200,7 +214,9 @@ def fused_block_state_bmm_kernel(
         num_total_programs = (nheads * ndsblocks)
         ratio = num_total_programs // (ngroups * ntcblocks * ntbblocks)
 
-        # skip no task assigned
+        # NOTE: it's possible that the number of programs is larger
+        #       than the number of block MMs to be computed. Return immediately
+        #       if no MM assigned to this program
         if num_total_programs % ratio != 0:
             return
 
