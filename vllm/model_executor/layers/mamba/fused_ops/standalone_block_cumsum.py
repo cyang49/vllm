@@ -116,21 +116,26 @@ def block_cumsum_kernel(
         #       Also, (t_end-t_start) would be the count including
         #       padded elements. To get the real token count, use
         #       either block_cu_seqlen or block_ntokens.
-        t_start, t_end, _ = load_t_offsets(pid_n,
-                                           block_packed_cu_seqlens_ptr,
-                                           stride_block_packed_cu_seqlens_n,
-                                           ALIGNED=ALIGN_OUTPUT_BLOCKS,
-                                           PACK_SIZE=4)
-        offs_t = t_start + tl.arange(0, block_size)
-        mask_t = offs_t < (t_start + ntokens)
+        align_t_start, _, _ = load_t_offsets(pid_n,
+                                             block_packed_cu_seqlens_ptr,
+                                             stride_block_packed_cu_seqlens_n,
+                                             ALIGNED=ALIGN_OUTPUT_BLOCKS,
+                                             PACK_SIZE=4)
+        align_offs_t = align_t_start + tl.arange(0, block_size)
+        align_mask_t = align_offs_t < (align_t_start + ntokens)
+    else:
+        align_offs_t, align_mask_t = offs_t, mask_t
 
-    dA_cumsum_ptrs = (dA_cumsum_ptr + offs_t[:, None] * stride_dA_cumsum_t +
+    dA_cumsum_ptrs = (dA_cumsum_ptr +
+                      align_offs_t[:, None] * stride_dA_cumsum_t +
                       offs_h[None, :] * stride_dA_cumsum_h)
-    tl.store(dA_cumsum_ptrs, dA_cs, mask=mask_t[:, None] & mask_h[None, :])
+    tl.store(dA_cumsum_ptrs,
+             dA_cs,
+             mask=align_mask_t[:, None] & mask_h[None, :])
 
     dt_out_ptrs = (dt_out_ptr + offs_h[None, :] * stride_dt_out_h +
-                   offs_t[:, None] * stride_dt_out_t)
-    tl.store(dt_out_ptrs, dt, mask=mask_t[:, None] & mask_h[None, :])
+                   align_offs_t[:, None] * stride_dt_out_t)
+    tl.store(dt_out_ptrs, dt, mask=align_mask_t[:, None] & mask_h[None, :])
 
 
 def block_cumsum(
