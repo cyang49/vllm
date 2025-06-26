@@ -6,6 +6,8 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+from .utils import load_t_offsets
+
 # try:
 #     from triton.language.extra.cuda.libdevice import fast_expf
 # except ImportError:
@@ -98,9 +100,9 @@ def state_passing_kernel(
     IS_STORE_PREV_STATES: tl.constexpr,
     ALIGN_BLOCKS: tl.constexpr,
 ):
-    pid_h = tl.program_id(2)  # head idx
     pid_d = tl.program_id(0)
     pid_s = tl.program_id(1)
+    pid_h = tl.program_id(2)  # head idx
 
     offs_d = (pid_d * BLOCK_SIZE_D) + tl.arange(0, BLOCK_SIZE_D)
     offs_s = (pid_s * BLOCK_SIZE_S) + tl.arange(0, BLOCK_SIZE_S)
@@ -144,28 +146,24 @@ def state_passing_kernel(
                      mask=(mask_d[:, None] & mask_s[None, :]))
 
         # update state
-        t_start = tl.load(block_cu_seqlens_ptr + n * stride_block_cu_seqlens_n)
-        t_end = tl.load(block_cu_seqlens_ptr +
-                        (n + 1) * stride_block_cu_seqlens_n)
-        ntokens = t_end - t_start
-
+        t_start, _, ntokens = load_t_offsets(n, block_cu_seqlens_ptr,
+                                             stride_block_cu_seqlens_n)
         if ALIGN_BLOCKS:
             tl.static_assert(dA_cumsum_ptr.dtype.element_ty == tl.float32)
-            align_t_start = tl.load(block_packed_cu_seqlens_ptr +
-                                    n * stride_block_packed_cu_seqlens_n)
-            align_t_start = tl.multiple_of(
-                align_t_start, 4)  # not sure if the hint works in if block
-        else:
-            align_t_start = t_start
-
+            t_start, _, _ = load_t_offsets(n,
+                                           block_packed_cu_seqlens_ptr,
+                                           stride_block_packed_cu_seqlens_n,
+                                           ALIGNED=ALIGN_BLOCKS,
+                                           PACK_SIZE=4)
         dA_cumsum_last = tl.load(
             dA_cumsum_ptr_base +
-            (align_t_start + ntokens - 1) * stride_dA_cumsum_t)  # scalar
-        block_decay = tl.exp(dA_cumsum_last)
-
+            (t_start + ntokens - 1) * stride_dA_cumsum_t)  # scalar
         state = tl.load(block_states_ptrs + n * stride_block_states_n,
                         mask=(mask_d[:, None] & mask_s[None, :]),
                         other=0.0)
+
+        # core computation
+        block_decay = tl.exp(dA_cumsum_last)
         state += block_decay * prev_state
 
         # store back
