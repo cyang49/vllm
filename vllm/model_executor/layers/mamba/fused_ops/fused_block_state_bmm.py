@@ -28,17 +28,17 @@ from .utils import load_t_offsets, load_with_aligned_mask
 # Best found on H100
 @triton.autotune(
     configs=[
-        # triton.Config(
-        #     {
-        #         'BLOCK_SIZE_TT': 64,
-        #         'BLOCK_SIZE_D': 64,
-        #         'BLOCK_SIZE_S': 64,
-        #         'BLOCK_SIZE_T0': 16,
-        #         'BLOCK_SIZE_T1': 16,
-        #         'ALIGN_MASK': True,
-        #     },
-        #     num_warps=2,
-        #     num_stages=3),
+        triton.Config(
+            {
+                'BLOCK_SIZE_TT': 64,
+                'BLOCK_SIZE_D': 64,
+                'BLOCK_SIZE_S': 64,
+                'BLOCK_SIZE_T0': 16,
+                'BLOCK_SIZE_T1': 16,
+                'ALIGN_MASK': True,
+            },
+            num_warps=2,
+            num_stages=3),
         triton.Config(
             {
                 'BLOCK_SIZE_TT': 64,
@@ -125,12 +125,17 @@ def fused_block_state_bmm_kernel(
     # Load block start and end offset
     t_start, _, ntokens = load_t_offsets(pid_n, block_cu_seqlens_ptr,
                                          stride_block_cu_seqlens_n)
-    align_t_start, _, align_ntokens = load_t_offsets(
-        pid_n,
-        block_packed_cu_seqlens_ptr,
-        stride_block_packed_cu_seqlens_n,
-        ALIGNED=ALIGN_BLOCKS,
-        PACK_SIZE=4)
+    if ALIGN_BLOCKS:
+        tl.static_assert(dA_cumsum_ptr.dtype.element_ty == tl.float32)
+        tl.static_assert(dt_ptr.dtype.element_ty == tl.float32)
+        align_t_start, _, align_ntokens = load_t_offsets(
+            pid_n,
+            block_packed_cu_seqlens_ptr,
+            stride_block_packed_cu_seqlens_n,
+            ALIGNED=ALIGN_BLOCKS,
+            PACK_SIZE=4)
+    else:
+        align_t_start, align_ntokens = t_start, ntokens
 
     # Mask out-of-bound tokens
     mask_d = offs_d < headdim

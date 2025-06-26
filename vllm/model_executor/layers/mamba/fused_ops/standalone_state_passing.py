@@ -148,12 +148,15 @@ def state_passing_kernel(
         t_end = tl.load(block_cu_seqlens_ptr +
                         (n + 1) * stride_block_cu_seqlens_n)
         ntokens = t_end - t_start
-        align_t_start = t_start
+
         if ALIGN_BLOCKS:
+            tl.static_assert(dA_cumsum_ptr.dtype.element_ty == tl.float32)
             align_t_start = tl.load(block_packed_cu_seqlens_ptr +
                                     n * stride_block_packed_cu_seqlens_n)
             align_t_start = tl.multiple_of(
                 align_t_start, 4)  # not sure if the hint works in if block
+        else:
+            align_t_start = t_start
 
         dA_cumsum_last = tl.load(
             dA_cumsum_ptr_base +
