@@ -221,7 +221,6 @@ def state_passing(
                           (prev_states.stride(0), prev_states.stride(1),
                            prev_states.stride(2), prev_states.stride(3)))
     # Launch grid
-    # TODO: need to find a good decomposition strategy for max parallelism
     grid = lambda META: (triton.cdiv(headdim, META['BLOCK_SIZE_D']),
                          triton.cdiv(dstate, META['BLOCK_SIZE_S']), nheads)
 

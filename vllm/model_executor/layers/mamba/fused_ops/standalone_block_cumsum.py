@@ -7,12 +7,7 @@ import torch
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import softplus
 from vllm.triton_utils import tl, triton
 
-
-@triton.jit
-def align(start, pack_size=4):
-    aligned_start = ((start + (pack_size - 1)) // pack_size) * pack_size
-    aligned_start = tl.multiple_of(aligned_start, pack_size)
-    return aligned_start
+from .utils import load_t_offsets
 
 
 # from .utils import generate_autotune_combinations
@@ -70,16 +65,14 @@ def block_cumsum_kernel(
     HAS_DT_BIAS: tl.constexpr,
     USE_DT_SOFTPLUS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
-    ALLIGN_OUTPUT_BLOCKS: tl.constexpr,
+    ALIGN_OUTPUT_BLOCKS: tl.constexpr,
 ):
     pid_n = tl.program_id(0)  # block idx
     pid_h = tl.program_id(1)  # head idx
 
     # Load block start and end offset
-    t_start = tl.load(block_cu_seqlens_ptr + pid_n * stride_block_cu_seqlens_n)
-    t_end = tl.load(block_cu_seqlens_ptr +
-                    (pid_n + 1) * stride_block_cu_seqlens_n)
-    ntokens = t_end - t_start
+    t_start, t_end, ntokens = load_t_offsets(pid_n, block_cu_seqlens_ptr,
+                                             stride_block_cu_seqlens_n)
 
     offs_t = t_start + tl.arange(0, block_size)
     offs_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
@@ -112,7 +105,9 @@ def block_cumsum_kernel(
     dA_cs = tl.cumsum(dA, axis=0)
 
     # Store back
-    if ALLIGN_OUTPUT_BLOCKS:
+    if ALIGN_OUTPUT_BLOCKS:
+        tl.static_assert(dA_cumsum_ptr.dtype.element_ty == tl.float32)
+        tl.static_assert(dt_out_ptr.dtype.element_ty == tl.float32)
         tl.static_assert(block_size % 4 == 0)
         # NOTE: the indices in block_packed_cu_seqlens can be padded
         #       to the pack_size. As such, while t_start points to
@@ -121,14 +116,14 @@ def block_cumsum_kernel(
         #       Also, (t_end-t_start) would be the count including
         #       padded elements. To get the real token count, use
         #       either block_cu_seqlen or block_ntokens.
-        t_start = tl.load(block_packed_cu_seqlens_ptr +
-                          pid_n * stride_block_packed_cu_seqlens_n)
-        t_end = tl.load(block_packed_cu_seqlens_ptr +
-                        (pid_n + 1) * stride_block_packed_cu_seqlens_n)
+        t_start, t_end, _ = load_t_offsets(pid_n,
+                                           block_packed_cu_seqlens_ptr,
+                                           stride_block_packed_cu_seqlens_n,
+                                           ALIGNED=ALIGN_OUTPUT_BLOCKS,
+                                           PACK_SIZE=4)
         offs_t = t_start + tl.arange(0, block_size)
         mask_t = offs_t < (t_start + ntokens)
 
-    # FIXME: stores are not coalesced?
     dA_cumsum_ptrs = (dA_cumsum_ptr + offs_t[:, None] * stride_dA_cumsum_t +
                       offs_h[None, :] * stride_dA_cumsum_h)
     tl.store(dA_cumsum_ptrs, dA_cs, mask=mask_t[:, None] & mask_h[None, :])
@@ -195,7 +190,7 @@ def block_cumsum(
             stride_dt_out_t=dt_out.stride(1),
             HAS_DT_BIAS=(dt_bias is not None),
             USE_DT_SOFTPLUS=dt_softplus,
-            ALLIGN_OUTPUT_BLOCKS=align_blocks,
+            ALIGN_OUTPUT_BLOCKS=align_blocks,
         )
 
     return dA_cumsum, dt_out
