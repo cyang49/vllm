@@ -333,7 +333,6 @@ def fused_block_ssd(
         device=device)
 
     CB = (torch.full((nblocks, ngroups, block_size, block_size),
-                     float('-inf'),
                      dtype=torch.float32,
                      device=device) if FUSED_COMPUTE_CB else None)
     CB_strides = (0, 0, 0, 0) if CB is None else (CB.stride(0), CB.stride(1),

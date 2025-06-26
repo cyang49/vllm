@@ -309,10 +309,9 @@ def fused_block_state_bmm(
         dtype=torch.float32 if states_in_fp32 else dtype,
         device=device)
 
-    CB = (torch.full((nblocks, ngroups, block_size, block_size),
-                     float('-inf'),
-                     dtype=torch.float32,
-                     device=device) if FUSED_COMPUTE_CB else None)
+    CB = (torch.empty((nblocks, ngroups, block_size, block_size),
+                      dtype=torch.float32,
+                      device=device) if FUSED_COMPUTE_CB else None)
     CB_strides = (0, 0, 0, 0) if CB is None else (CB.stride(0), CB.stride(1),
                                                   CB.stride(2), CB.stride(3))
     # Launch grid
