@@ -563,9 +563,9 @@ class MambaMixer2(CustomOp):
             C_p = C_p.view(num_prefill_tokens, self.n_groups // self.tp_size,
                            -1)
 
-            num_fused = 3
+            num_fused = 4
             if num_fused == 2:  # 2 kernel control flow
-                align_blocks = False
+                align_blocks = True
                 dA_cumsum, dt_out, block_states, CB = fused_block_ssd_intra(
                     x=x_p,
                     dt=dt_p,
@@ -584,6 +584,41 @@ class MambaMixer2(CustomOp):
                     packed_seqlen=mamba2_metadata.packed_seqlen,
                 )
 
+                # final_states, prev_states = state_passing(
+                #     dA_cumsum=dA_cumsum,
+                #     block_states=block_states,
+                #     initial_states=initial_states,
+                #     block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                #     block_req_idx=mamba2_metadata.block_req_idx,
+                #     req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
+                #     return_prev_states=True,
+                #     out_dtype=C_p.dtype,
+                #     align_blocks=align_blocks,
+                #     block_packed_cu_seqlens=mamba2_metadata.
+                #     block_packed_cu_seqlens,
+                # )
+
+                # # Fused state passing - Confirmed working
+                # _, scan_output, _ = fused_block_scan(
+                #     x=x_p,
+                #     dt=dt_out,
+                #     dA_cumsum=dA_cumsum,
+                #     block_states=prev_states,
+                #     initial_states=initial_states,
+                #     C=C_p,
+                #     D=self.D,
+                #     CB=CB,
+                #     block_cu_seqlens=mamba2_metadata.block_cu_seqlens,
+                #     block_req_idx=mamba2_metadata.block_req_idx,
+                #     req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
+                #     return_prev_states=False,
+                #     fused_state_passing=False,
+                #     align_blocks=align_blocks,
+                #     out_dtype=C_p.dtype,
+                #     block_packed_cu_seqlens=mamba2_metadata.
+                #     block_packed_cu_seqlens,
+                # )
+
                 # Fused state passing - Confirmed working
                 final_states, scan_output, _ = fused_block_scan(
                     x=x_p,
@@ -599,7 +634,12 @@ class MambaMixer2(CustomOp):
                     req_cu_nblocks=mamba2_metadata.req_cu_nblocks,
                     return_prev_states=False,
                     fused_state_passing=True,
+                    align_blocks=align_blocks,
+                    out_dtype=C_p.dtype,
+                    block_packed_cu_seqlens=mamba2_metadata.
+                    block_packed_cu_seqlens,
                 )
+
             else:
                 align_blocks = True
                 if num_fused == 3:

@@ -6,10 +6,12 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-# try:
-#     from triton.language.extra.cuda.libdevice import fast_expf
-# except ImportError:
-#     from triton.language.math import fast_expf
+try:
+    from triton.language.extra.cuda.libdevice import add_rn, fast_expf, mul_rn
+except ImportError:
+    from triton.language.math import add_rn, fast_expf, mul_rn
+
+from .utils import load_t_offsets, load_with_aligned_mask
 
 # Notations for readability
 #   - b: batch
@@ -24,103 +26,123 @@ from vllm.triton_utils import tl, triton
 
 # from .utils import generate_autotune_combinations
 # @triton.autotune(
-#     configs=generate_autotune_combinations(
-#         spec={'BLOCK_SIZE_D': [32, 64],
-#               'BLOCK_SIZE_T0': [32, 64],
-#               'BLOCK_SIZE_T1': [32, 64],
-#               'num_warps': [2, 4],
-#               'num_stages': [1, 2, 3, 4, 5],
-#              },
-#         ),
+#     configs=generate_autotune_combinations(spec={
+#         'BLOCK_SIZE_D': [16, 32, 64],
+#         'BLOCK_SIZE_T0': [16, 32, 64],
+#         'BLOCK_SIZE_K': [16, 32, 64],
+#         'USE_FAST_MATH': [True],
+#         'ALIGN_MASK': [False, True],
+#         'num_warps': [2, 4],
+#         'num_stages': [1, 2, 3],
+#     }, ),
 #     key=[],
 # )
-@triton.autotune(  # output calculation only
+@triton.autotune(  # best for non-tiled dstate
     configs=[
         triton.Config(
             {
                 'BLOCK_SIZE_D': 64,
                 'BLOCK_SIZE_T0': 64,
-                'BLOCK_SIZE_T1': 64
+                'BLOCK_SIZE_K': 32,
+                'USE_FAST_MATH': True,
+                'ALIGN_MASK': True,
             },
             num_warps=4,
-            num_stages=1),  # BEST H100 2k, 8k full
+            num_stages=3),
+        triton.Config(
+            {
+                'BLOCK_SIZE_D': 64,
+                'BLOCK_SIZE_T0': 64,
+                'BLOCK_SIZE_K': 32,
+                'USE_FAST_MATH': True,
+                'ALIGN_MASK': False,
+            },
+            num_warps=4,
+            num_stages=3),
     ],
     key=[],
 )
 @triton.jit
 def fused_block_scan_v1_kernel(
-    # Inputs
-    x_ptr,
-    dt_ptr,
-    dA_cumsum_ptr,
-    block_states_ptr,
-    init_states_ptr,
-    C_ptr,
-    D_ptr,
-    CB_ptr,
-    block_cu_seqlens_ptr,
-    block_req_idx_ptr,
-    req_cu_nblocks_ptr,
-    # Outputs
-    prev_states_ptr,
-    final_states_ptr,
-    output_ptr,
-    # Matrix dimensions
-    block_size: tl.constexpr,
-    headdim: tl.constexpr,
-    dstate: tl.constexpr,
-    nheads_ngroups_ratio: tl.constexpr,
-    # Strides
-    stride_x_t: tl.constexpr,
-    stride_x_h,  #: tl.constexpr,
-    stride_x_d: tl.constexpr,
-    stride_dt_h,
-    stride_dt_t: tl.constexpr,
-    stride_dA_cumsum_h,
-    stride_dA_cumsum_t: tl.constexpr,
-    stride_block_states_n: tl.constexpr,
-    stride_block_states_h: tl.constexpr,
-    stride_block_states_d: tl.constexpr,
-    stride_block_states_s: tl.constexpr,
-    stride_init_states_b: tl.constexpr,
-    stride_init_states_h: tl.constexpr,
-    stride_init_states_d: tl.constexpr,
-    stride_init_states_s: tl.constexpr,
-    stride_C_t: tl.constexpr,
-    stride_C_g,  #: tl.constexpr,
-    stride_C_s: tl.constexpr,
-    stride_D_h: tl.constexpr,
-    stride_CB_n: tl.constexpr,
-    stride_CB_g: tl.constexpr,
-    stride_CB_t0: tl.constexpr,
-    stride_CB_t1: tl.constexpr,
-    stride_block_cu_seqlens_n: tl.constexpr,
-    stride_block_req_idx_n: tl.constexpr,
-    stride_req_cu_nblocks_b: tl.constexpr,
-    stride_prev_states_n: tl.constexpr,
-    stride_prev_states_h: tl.constexpr,
-    stride_prev_states_d: tl.constexpr,
-    stride_prev_states_s: tl.constexpr,
-    stride_final_states_b: tl.constexpr,
-    stride_final_states_h: tl.constexpr,
-    stride_final_states_d: tl.constexpr,
-    stride_final_states_s: tl.constexpr,
-    stride_output_t: tl.constexpr,
-    stride_output_h: tl.constexpr,
-    stride_output_d: tl.constexpr,
-    # Meta-parameters
-    BLOCK_SIZE_D: tl.constexpr,
-    BLOCK_SIZE_S: tl.constexpr,
-    BLOCK_SIZE_T0: tl.constexpr,
-    BLOCK_SIZE_T1: tl.constexpr,
-    IS_STORE_PREV_STATES: tl.constexpr,
-    IF_FUSED_STATE_PASSING: tl.constexpr,
+        # Inputs
+        x_ptr,
+        dt_ptr,
+        dA_cumsum_ptr,
+        block_states_ptr,
+        init_states_ptr,
+        C_ptr,
+        D_ptr,
+        CB_ptr,
+        block_cu_seqlens_ptr,
+        block_packed_cu_seqlens_ptr,
+        block_req_idx_ptr,
+        req_cu_nblocks_ptr,
+        # Outputs
+        prev_states_ptr,
+        final_states_ptr,
+        output_ptr,
+        # Matrix dimensions
+        # block_size: tl.constexpr,
+        headdim: tl.constexpr,
+        dstate: tl.constexpr,
+        nheads_ngroups_ratio: tl.constexpr,
+        # Strides
+        stride_x_t: tl.constexpr,
+        stride_x_h,  #: tl.constexpr,
+        stride_x_d: tl.constexpr,
+        stride_dt_h,
+        stride_dt_t: tl.constexpr,
+        stride_dA_cumsum_h,
+        stride_dA_cumsum_t: tl.constexpr,
+        stride_block_states_n: tl.constexpr,
+        stride_block_states_h: tl.constexpr,
+        stride_block_states_d: tl.constexpr,
+        stride_block_states_s: tl.constexpr,
+        stride_init_states_b: tl.constexpr,
+        stride_init_states_h: tl.constexpr,
+        stride_init_states_d: tl.constexpr,
+        stride_init_states_s: tl.constexpr,
+        stride_C_t: tl.constexpr,
+        stride_C_g,  #: tl.constexpr,
+        stride_C_s: tl.constexpr,
+        stride_D_h: tl.constexpr,
+        stride_CB_n: tl.constexpr,
+        stride_CB_g: tl.constexpr,
+        stride_CB_t0: tl.constexpr,
+        stride_CB_t1: tl.constexpr,
+        stride_block_cu_seqlens_n: tl.constexpr,
+        stride_block_packed_cu_seqlens_n: tl.constexpr,
+        stride_block_req_idx_n: tl.constexpr,
+        stride_req_cu_nblocks_b: tl.constexpr,
+        stride_prev_states_n: tl.constexpr,
+        stride_prev_states_h: tl.constexpr,
+        stride_prev_states_d: tl.constexpr,
+        stride_prev_states_s: tl.constexpr,
+        stride_final_states_b: tl.constexpr,
+        stride_final_states_h: tl.constexpr,
+        stride_final_states_d: tl.constexpr,
+        stride_final_states_s: tl.constexpr,
+        stride_output_t: tl.constexpr,
+        stride_output_h: tl.constexpr,
+        stride_output_d: tl.constexpr,
+        # Meta-parameters
+        BLOCK_SIZE_D: tl.constexpr,
+        BLOCK_SIZE_S: tl.constexpr,
+        BLOCK_SIZE_T0: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr,
+        IS_STORE_PREV_STATES: tl.constexpr,
+        IF_FUSED_STATE_PASSING: tl.constexpr,
+        USE_FAST_MATH: tl.constexpr,
+        ALIGN_BLOCKS: tl.constexpr,  # Aligned input tensor blocks
+        ALIGN_MASK: tl.constexpr,  # Use aligned mask in tl.load    
 ):
+    tl.static_assert((ALIGN_MASK and ALIGN_BLOCKS) or not ALIGN_MASK)
     pid_n = tl.program_id(1)  # block idx
     pid_h = tl.program_id(2)  # head idx
-    nt0blocks = tl.cdiv(block_size, BLOCK_SIZE_T0)
-    pid_d = tl.program_id(0) // nt0blocks
-    pid_t0 = tl.program_id(0) % nt0blocks
+    pid_g = pid_h // nheads_ngroups_ratio  # group idx
+    ndblocks = tl.cdiv(headdim, BLOCK_SIZE_D)
+    pid_t0 = tl.program_id(0) // ndblocks
+    pid_d = tl.program_id(0) % ndblocks
 
     offs_d = (pid_d * BLOCK_SIZE_D) + tl.arange(0, BLOCK_SIZE_D)
     offs_s = tl.arange(0, BLOCK_SIZE_S)
@@ -130,11 +152,21 @@ def fused_block_scan_v1_kernel(
     block_start = tl.load(req_cu_nblocks_ptr + pid_b * stride_req_cu_nblocks_b)
     block_end = tl.load(req_cu_nblocks_ptr +
                         (pid_b + 1) * stride_req_cu_nblocks_b)
+
     # start and end token index in seqlen dimension
-    t_start = tl.load(block_cu_seqlens_ptr + pid_n * stride_block_cu_seqlens_n)
-    t_end = tl.load(block_cu_seqlens_ptr +
-                    (pid_n + 1) * stride_block_cu_seqlens_n)
-    ntokens = t_end - t_start
+    t_start, _, ntokens = load_t_offsets(pid_n, block_cu_seqlens_ptr,
+                                         stride_block_cu_seqlens_n)
+    if ALIGN_BLOCKS:
+        tl.static_assert(dA_cumsum_ptr.dtype.element_ty == tl.float32)
+        tl.static_assert(dt_ptr.dtype.element_ty == tl.float32)
+        align_t_start, _, align_ntokens = load_t_offsets(
+            pid_n,
+            block_packed_cu_seqlens_ptr,
+            stride_block_packed_cu_seqlens_n,
+            ALIGNED=ALIGN_BLOCKS,
+            PACK_SIZE=4)
+    else:
+        align_t_start, align_ntokens = t_start, ntokens
 
     # Mask out-of-bound tokens
     mask_d = offs_d < headdim
@@ -146,7 +178,6 @@ def fused_block_scan_v1_kernel(
         + offs_s[None, :] * stride_block_states_s)
     dA_cumsum_ptr_h = dA_cumsum_ptr + pid_h * stride_dA_cumsum_h
 
-    prev_state = tl.zeros((BLOCK_SIZE_D, BLOCK_SIZE_S), dtype=tl.float32)
     if IF_FUSED_STATE_PASSING:
         init_states_ptrs = init_states_ptr + (
             pid_b * stride_init_states_b + pid_h * stride_init_states_h +
@@ -171,15 +202,13 @@ def fused_block_scan_v1_kernel(
                         offs_s[None, :] * stride_prev_states_s)
                     prev_states_ptrs_t = prev_states_ptrs + t * stride_prev_states_n
                     tl.store(prev_states_ptrs_t,
-                             prev_state,
+                             prev_state.to(prev_states_ptr.dtype.element_ty),
                              mask=(mask_d[:, None] & mask_s[None, :]))
             # update state
             if (t < pid_n) or (t == (block_end - 1)):
-                t_end = tl.load(block_cu_seqlens_ptr +
-                                (t + 1) * stride_block_cu_seqlens_n)
-                dA_cumsum_last = tl.load(
-                    dA_cumsum_ptr_h +
-                    (t_end - 1) * stride_dA_cumsum_t)  # scalar
+                dA_cumsum_last = tl.load(dA_cumsum_ptr_h +
+                                         (align_t_start + ntokens - 1) *
+                                         stride_dA_cumsum_t)  # scalar
                 block_decay = tl.exp(dA_cumsum_last)
 
                 block_states_ptrs_t = block_states_ptrs + t * stride_block_states_n
@@ -196,7 +225,7 @@ def fused_block_scan_v1_kernel(
                         offs_d[:, None] * stride_final_states_d +
                         offs_s[None, :] * stride_final_states_s)
                     tl.store(final_states_ptrs,
-                             state,
+                             state.to(final_states_ptr.dtype.element_ty),
                              mask=(mask_d[:, None] & mask_s[None, :]))
                 elif (t < pid_n):
                     # update prev_state only if it's not the last
@@ -210,12 +239,14 @@ def fused_block_scan_v1_kernel(
                              mask=(mask_d[:, None] & mask_s[None, :]),
                              other=0.0)
 
-    pid_g = pid_h // nheads_ngroups_ratio  # group idx
-    t0_range = tl.arange(0, BLOCK_SIZE_T0)
+    # Set base pointers
     t0 = pid_t0 * BLOCK_SIZE_T0
-    offs_t0_local = t0 + t0_range
+    offs_t0_local = t0 + tl.arange(0, BLOCK_SIZE_T0)
     offs_t0_global = t_start + offs_t0_local
+    aligned_t0_global = align_t_start + offs_t0_local
+
     mask_t0 = offs_t0_local < ntokens
+    aligned_mask_t0 = offs_t0_local < align_ntokens
 
     # compute base pointers
     x_ptr_base = x_ptr + pid_h * stride_x_h
@@ -224,64 +255,91 @@ def fused_block_scan_v1_kernel(
     C_ptr_base = C_ptr + pid_g * stride_C_g
     output_ptr_base = output_ptr + pid_h * stride_output_h
 
-    D = tl.load(D_ptr + pid_h * stride_D_h)
-
     # 2. compute output
     x_t0_ptrs = x_ptr_base + (
         offs_t0_global[:, None] * stride_x_t + offs_d[None, :] * stride_x_d
-    )  # (BLOCK_SIZE_T0, headdim)
-
+    )  # (BLOCK_SIZE_T0, BLOCK_SIZE_D)
     x_t0 = tl.load(x_t0_ptrs,
                    mask=(mask_t0[:, None] & mask_d[None, :]),
                    other=0.0)
+
+    # 2.1 xD term
+    D = tl.load(D_ptr + pid_h * stride_D_h)
     acc = (x_t0 * D).to(tl.float32)
 
+    dA_cumsum_t0_ptrs = dA_cumsum_ptr_h + (
+        aligned_t0_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_T0,)
+    dA_cumsum_t0 = load_with_aligned_mask(dA_cumsum_t0_ptrs,
+                                          mask_t0,
+                                          aligned_mask_t0,
+                                          ALIGN_MASK=ALIGN_MASK)
+
+    k_range = tl.arange(0, BLOCK_SIZE_K)
+
     # 2.2 compute off-diagonal block contributions to the output
-    dA_cumsum_t0_ptrs = dA_cumsum_ptr_h + (offs_t0_global * stride_dA_cumsum_t
-                                           )  # (BLOCK_SIZE_T0,)
-    dA_cumsum_t0 = tl.load(dA_cumsum_t0_ptrs, mask=mask_t0, other=0.0)
     C_ptrs = C_ptr_base + (
         offs_t0_global[:, None] * stride_C_t + offs_s[None, :] * stride_C_s
-    )  # (BLOCK_SIZE_T0, dstate)
+    )  # (BLOCK_SIZE_T0, BLOCK_SIZE_S)
     C = tl.load(C_ptrs, mask=(mask_t0[:, None] & mask_s[None, :]), other=0.0)
-    prev_state = prev_state.to(C.dtype)
-    acc += (tl.dot(C, prev_state.T) * tl.exp(dA_cumsum_t0[:, None])
-            )  #(BLOCK_SIZE_T0, headdim)
+    if USE_FAST_MATH:
+        acc += mul_rn(tl.dot(C,
+                             prev_state.to(C.dtype).T),
+                      fast_expf(dA_cumsum_t0)[:, None])
+    else:
+        acc += (tl.dot(C,
+                       prev_state.to(C.dtype).T) *
+                tl.exp(dA_cumsum_t0)[:, None])  #(BLOCK_SIZE_T0, BLOCK_SIZE_D)
 
-    t1_range = tl.arange(0, BLOCK_SIZE_T1)
-    for t1 in range(0, ntokens, BLOCK_SIZE_T1):
-        mask_t1 = t1_range < (ntokens - t1)  # (BLOCK_SIZE_T1,)
-        offs_t1_local = t1 + t1_range
+    # 2.3 compute diagonal output contribution
+    for t1 in range(0, ntokens, BLOCK_SIZE_K):
+        mask_t1 = k_range < (ntokens - t1)  # (BLOCK_SIZE_K,)
+        offs_t1_local = t1 + k_range
         offs_t1_global = t_start + offs_t1_local
+        aligned_t1_global = align_t_start + offs_t1_local
         mask_t1 = offs_t1_local < ntokens
+        aligned_mask_t1 = offs_t1_local < align_ntokens
 
         dA_cumsum_t1_ptrs = dA_cumsum_ptr_h + (
-            offs_t1_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_T1,)
-        dt_t1_ptrs = dt_ptr_base + (offs_t1_global * stride_dt_t
-                                    )  # (BLOCK_SIZE_T1,)
-        dt_t1 = tl.load(dt_t1_ptrs, mask=mask_t1, other=0.0)
-        dA_cumsum_t1 = tl.load(dA_cumsum_t1_ptrs, mask=mask_t1, other=0.0)
+            aligned_t1_global * stride_dA_cumsum_t)  # (BLOCK_SIZE_K,)
+        dt_t1_ptrs = dt_ptr_base + (aligned_t1_global * stride_dt_t
+                                    )  # (BLOCK_SIZE_K,)
+
+        dt_t1 = load_with_aligned_mask(dt_t1_ptrs,
+                                       mask_t1,
+                                       aligned_mask_t1,
+                                       ALIGN_MASK=ALIGN_MASK)
+        dA_cumsum_t1 = load_with_aligned_mask(dA_cumsum_t1_ptrs,
+                                              mask_t1,
+                                              aligned_mask_t1,
+                                              ALIGN_MASK=ALIGN_MASK)
+
         x_t1_ptrs = x_ptr_base + (
             offs_t1_global[:, None] * stride_x_t + offs_d[None, :] * stride_x_d
-        )  # (BLOCK_SIZE_T1, headdim)
+        )  # (BLOCK_SIZE_K, BLOCK_SIZE_D)
         x_t1 = tl.load(x_t1_ptrs,
                        mask=(mask_t1[:, None] & mask_d[None, :]),
                        other=0.0)
         CB_ptrs = CB_ptr_base + (offs_t0_local[:, None] * stride_CB_t0 +
                                  offs_t1_local[None, :] * stride_CB_t1
-                                 )  # (BLOCK_SIZE_T0, BLOCK_SIZE_T1)
+                                 )  # (BLOCK_SIZE_T0, BLOCK_SIZE_K)
 
-        # 2.1 compute diagonal output contribution
-        # ok to not mask - causal mask applied later
+        # ok to not use load mask - causal mask applied later
         CB = tl.load(CB_ptrs)
 
-        #(BLOCK_SIZE_T0, BLOCK_SIZE_T1)
-        seg_sum = dA_cumsum_t0[:, None] - dA_cumsum_t1[None, :]
-        decay = tl.exp(seg_sum)
-        # decay = fast_expf(seg_sum)
+        causal_mask = offs_t0_local[:, None] >= offs_t1_local[None, :]
 
-        scores = tl.where((offs_t0_local[:, None] >= offs_t1_local[None, :]),
-                          CB * decay * dt_t1[None, :], 0.0)
+        #(BLOCK_SIZE_T0, BLOCK_SIZE_K)
+        # NOTE: Fast math can be faster but it's not portable
+        if not USE_FAST_MATH:
+            seg_sum = dA_cumsum_t0[:, None] - dA_cumsum_t1[None, :]
+            decay = tl.exp(seg_sum)
+            scores = CB * decay * dt_t1[None, :]
+        else:
+            seg_sum = add_rn(dA_cumsum_t0[:, None], -dA_cumsum_t1[None, :])
+            decay = fast_expf(seg_sum)
+            scores = mul_rn(mul_rn(CB, decay), dt_t1[None, :])
+
+        scores = tl.where(causal_mask, scores, 0.0)
         # lower precision (prevents out of resource compile error on H100)
         scores = scores.to(x_ptr.dtype.element_ty)
         acc += tl.dot(scores, x_t1)
@@ -298,20 +356,23 @@ def fused_block_scan_v1_kernel(
 # output (seqlen, nheads, headdim)
 # prev_states (nblocks, nheads, headdim, dstate) # Optional for debug
 def fused_block_scan(
-    x,  # (seqlen, nheads, headdim)
-    dt,  # (nheads, seqlen)
-    dA_cumsum,  # (nheads, seqlen)
-    block_states,  # (nblocks, block_size, headdim, dstate)
-    initial_states,  # (batch, nheads, headdim, dstate)
-    C,  # (seqlen, ngroups, dstate)
-    D,
-    CB,  # (nblocks, ngroups, block_size, block_size)
-    # metadata
+        x,  # (seqlen, nheads, headdim)
+        dt,  # (nheads, seqlen)
+        dA_cumsum,  # (nheads, seqlen)
+        block_states,  # (nblocks, block_size, headdim, dstate)
+        initial_states,  # (batch, nheads, headdim, dstate)
+        C,  # (seqlen, ngroups, dstate)
+        D,
+        CB,  # (nblocks, ngroups, block_size, block_size)
+        # metadata
     block_cu_seqlens,  # (nblocks+1,)
-    block_req_idx,  # (nblocks, )
-    req_cu_nblocks,  # (batch+1, )
-    return_prev_states=False,
-    fused_state_passing=False,
+        block_req_idx,  # (nblocks, )
+        req_cu_nblocks,  # (batch+1, )
+        return_prev_states=False,
+        fused_state_passing=False,
+        block_packed_cu_seqlens=None,  # (nblocks+1,)
+        align_blocks=False,
+        out_dtype=None,  # states dtype
 ):
     seqlen, nheads, headdim = x.shape
     ngroups = C.shape[1]
@@ -320,8 +381,10 @@ def fused_block_scan(
     nblocks = block_states.shape[0]
     batch = initial_states.shape[0]
 
-    assert dt.shape == (nheads, seqlen)
-    assert dA_cumsum.shape == (nheads, seqlen)
+    aligned_seqlen = dt.shape[-1] if align_blocks else seqlen
+
+    assert dt.shape == (nheads, aligned_seqlen)
+    assert dA_cumsum.shape == (nheads, aligned_seqlen)
     assert C.shape == (seqlen, ngroups, dstate)
     assert D.shape == (nheads, )
     assert CB.shape == (nblocks, ngroups, block_size, block_size)
@@ -330,14 +393,18 @@ def fused_block_scan(
     assert block_cu_seqlens.shape == (nblocks + 1, )
     assert block_req_idx.shape == (nblocks, )
     assert req_cu_nblocks.shape == (batch + 1, )
+    if align_blocks:
+        assert block_packed_cu_seqlens.shape == block_cu_seqlens.shape
 
     device = x.device
 
     # Allocate outputs
-    prev_states = (torch.empty_like(block_states) if return_prev_states else
-                   None) if fused_state_passing else block_states
+    out_dtype = block_states.dtype if out_dtype is None else out_dtype
+    prev_states = (
+        torch.empty_like(block_states, dtype=out_dtype) if return_prev_states
+        else None) if fused_state_passing else block_states
     final_states = torch.empty((batch, nheads, headdim, dstate),
-                               dtype=block_states.dtype,
+                               dtype=out_dtype,
                                device=device)
     output = torch.empty_like(x)
     prev_state_strides = ((0, 0, 0, 0) if prev_states is None else
@@ -348,10 +415,9 @@ def fused_block_scan(
     #       computed redundantly among blocks of the same sequence.
     #       Alternatively, we can implement parallel scan if it brings
     #       significant performance difference
-    # TODO: need to find a good decomposition strategy for max parallelism
-    grid = lambda META: (
-        triton.cdiv(headdim, META['BLOCK_SIZE_D']) * triton.cdiv(
-            block_size, META['BLOCK_SIZE_T0']), nblocks, nheads)
+    grid = lambda META: (triton.cdiv(
+        block_size, META['BLOCK_SIZE_T0']) * triton.cdiv(
+            headdim, META['BLOCK_SIZE_D']), nblocks, nheads)
 
     with torch.cuda.device(x.device.index):
         fused_block_scan_v1_kernel[grid](
@@ -364,12 +430,13 @@ def fused_block_scan(
             D_ptr=D,
             CB_ptr=CB,
             block_cu_seqlens_ptr=block_cu_seqlens,
+            block_packed_cu_seqlens_ptr=block_packed_cu_seqlens,
             block_req_idx_ptr=block_req_idx,
             req_cu_nblocks_ptr=req_cu_nblocks,
             prev_states_ptr=prev_states,
             final_states_ptr=final_states,
             output_ptr=output,
-            block_size=block_size,
+            # block_size=block_size,
             headdim=headdim,
             dstate=dstate,
             nheads_ngroups_ratio=nheads // ngroups,
@@ -397,6 +464,8 @@ def fused_block_scan(
             stride_CB_t0=CB.stride(2),
             stride_CB_t1=CB.stride(3),
             stride_block_cu_seqlens_n=block_cu_seqlens.stride(0),
+            stride_block_packed_cu_seqlens_n=(block_packed_cu_seqlens.stride(0)
+                                              if align_blocks else 0),
             stride_block_req_idx_n=block_req_idx.stride(0),
             stride_req_cu_nblocks_b=req_cu_nblocks.stride(0),
             stride_prev_states_n=prev_state_strides[0],
@@ -413,6 +482,7 @@ def fused_block_scan(
             BLOCK_SIZE_S=max(dstate, 16),
             IS_STORE_PREV_STATES=return_prev_states,
             IF_FUSED_STATE_PASSING=fused_state_passing,
+            ALIGN_BLOCKS=align_blocks,
         )
 
     return final_states, output, prev_states
