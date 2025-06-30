@@ -11,7 +11,8 @@ try:
 except ImportError:
     from triton.language.math import add_rn, fast_expf, mul_rn
 
-from .utils import load_t_offsets, load_with_aligned_mask
+from .utils import (generate_autotune_combinations, load_t_offsets,
+                    load_with_aligned_mask)
 
 # Notations for readability
 #   - b: batch
@@ -24,7 +25,7 @@ from .utils import load_t_offsets, load_with_aligned_mask
 #   - s: dstate
 
 
-# from .utils import generate_autotune_combinations
+
 # @triton.autotune(
 #     configs=generate_autotune_combinations(spec={
 #         'BLOCK_SIZE_D': [16, 32, 64],
@@ -37,31 +38,44 @@ from .utils import load_t_offsets, load_with_aligned_mask
 #     }, ),
 #     key=[],
 # )
-@triton.autotune(  # best for non-tiled dstate
-    configs=[
-        triton.Config(
-            {
-                'BLOCK_SIZE_D': 64,
-                'BLOCK_SIZE_T0': 64,
-                'BLOCK_SIZE_K': 32,
-                'USE_FAST_MATH': True,
-                'ALIGN_MASK': True,
-            },
-            num_warps=4,
-            num_stages=3),
-        triton.Config(
-            {
-                'BLOCK_SIZE_D': 64,
-                'BLOCK_SIZE_T0': 64,
-                'BLOCK_SIZE_K': 32,
-                'USE_FAST_MATH': True,
-                'ALIGN_MASK': False,
-            },
-            num_warps=4,
-            num_stages=3),
-    ],
+@triton.autotune(  # narrowed down set of optimal configs 
+    #for different workflows
+    configs=generate_autotune_combinations(spec={
+        'BLOCK_SIZE_D': [64],
+        'BLOCK_SIZE_T0': [64],
+        'BLOCK_SIZE_K': [32],
+        'USE_FAST_MATH': [True],
+        'ALIGN_MASK': [False, True],
+        'num_warps': [4],
+        'num_stages': [1, 3],
+    }, ),
     key=[],
 )
+# @triton.autotune(  # best for non-tiled dstate
+#     configs=[
+#         triton.Config(
+#             {
+#                 'BLOCK_SIZE_D': 64,
+#                 'BLOCK_SIZE_T0': 64,
+#                 'BLOCK_SIZE_K': 32,
+#                 'USE_FAST_MATH': True,
+#                 'ALIGN_MASK': True,
+#             },
+#             num_warps=4,
+#             num_stages=1),
+#         triton.Config(
+#             {
+#                 'BLOCK_SIZE_D': 64,
+#                 'BLOCK_SIZE_T0': 64,
+#                 'BLOCK_SIZE_K': 32,
+#                 'USE_FAST_MATH': True,
+#                 'ALIGN_MASK': False,
+#             },
+#             num_warps=4,
+#             num_stages=1),
+#     ],
+#     key=[],
+# )
 @triton.jit
 def fused_block_scan_v1_kernel(
         # Inputs
