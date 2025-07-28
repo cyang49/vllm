@@ -4,12 +4,18 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
 
+from itertools import product
+
 import torch
 from packaging import version
 
 from vllm import _custom_ops as ops
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.triton_utils import HAS_TRITON, tl, triton
+
+from .quantization import (dequant_symmetric_per_tensor,
+                           dynamic_quant_symmetric_per_tensor_fp8e4nv,
+                           static_quant_symmetric_per_tensor_fp8e4nv)
 
 TRITON3 = HAS_TRITON and (version.parse(triton.__version__)
                           >= version.parse("3.0.0"))
@@ -28,6 +34,32 @@ else:
         return dt
 
 
+def generate_autotune_combinations(spec):
+    """
+    Generate all possible combinations of key-value pairs 
+    given keys and their value ranges.
+
+    Parameters:
+    - keys: List of keys.
+    - ranges: List of range objects or iterables corresponding to each key.
+
+    Returns:
+    - List of dictionaries, each representing a unique combination.
+    """
+    ranges = list(spec.values())
+    keys = list(spec.keys())
+    if len(keys) != len(ranges):
+        raise ValueError("The number of keys must match the number of ranges.")
+
+    value_combinations = product(*ranges)
+    return [
+        triton.Config(dict(zip(keys[:-2], values[:-2])), **{
+            keys[-2]: values[-2],
+            keys[-1]: values[-1],
+        }) for values in value_combinations
+    ]
+
+
 @triton.heuristics(
     {"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
 @triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
@@ -38,6 +70,15 @@ else:
 })
 @triton.heuristics(
     {"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
+# @triton.autotune(
+#     configs=generate_autotune_combinations(
+#         spec={'BLOCK_SIZE_M': [4, 8, 16, 32, 64], # headdim
+#               'num_warps': [2, 4, 8],
+#               'num_stages': [1, 2, 3],
+#              },
+#         ),
+#     key=[],
+# )
 @triton.jit
 def _selective_scan_update_kernel(
     # Pointers to matrices
@@ -52,44 +93,48 @@ def _selective_scan_update_kernel(
     z_ptr,
     out_ptr,
     state_batch_indices_ptr,
-    pad_slot_id,
+    pad_slot_id: tl.constexpr,
     # Matrix dimensions
-    batch,
-    nheads,
-    dim,
-    dstate,
-    nheads_ngroups_ratio,
+    dim: tl.constexpr,
+    dstate: tl.constexpr,
+    nheads_ngroups_ratio: tl.constexpr,
+    # Quantization
+    fp8_scale: tl.constexpr,
+    scales_ptr: tl.constexpr,
     # Strides
-    stride_state_batch,
-    stride_state_head,
-    stride_state_dim,
-    stride_state_dstate,
-    stride_x_batch,
-    stride_x_head,
-    stride_x_dim,
-    stride_dt_batch,
-    stride_dt_head,
-    stride_dt_dim,
-    stride_dt_bias_head,
-    stride_dt_bias_dim,
-    stride_A_head,
-    stride_A_dim,
-    stride_A_dstate,
-    stride_B_batch,
-    stride_B_group,
-    stride_B_dstate,
-    stride_C_batch,
-    stride_C_group,
-    stride_C_dstate,
-    stride_D_head,
-    stride_D_dim,
-    stride_z_batch,
-    stride_z_head,
-    stride_z_dim,
-    stride_out_batch,
-    stride_out_head,
-    stride_out_dim,
+    stride_state_batch: tl.constexpr,
+    stride_state_head: tl.constexpr,
+    stride_state_dim: tl.constexpr,
+    stride_state_dstate: tl.constexpr,
+    stride_x_batch: tl.constexpr,
+    stride_x_head: tl.constexpr,
+    stride_x_dim: tl.constexpr,
+    stride_dt_batch: tl.constexpr,
+    stride_dt_head: tl.constexpr,
+    stride_dt_dim: tl.constexpr,
+    stride_dt_bias_head: tl.constexpr,
+    stride_dt_bias_dim: tl.constexpr,
+    stride_A_head: tl.constexpr,
+    stride_A_dim: tl.constexpr,
+    stride_A_dstate: tl.constexpr,
+    stride_B_batch: tl.constexpr,
+    stride_B_group: tl.constexpr,
+    stride_B_dstate: tl.constexpr,
+    stride_C_batch: tl.constexpr,
+    stride_C_group: tl.constexpr,
+    stride_C_dstate: tl.constexpr,
+    stride_D_head: tl.constexpr,
+    stride_D_dim: tl.constexpr,
+    stride_z_batch: tl.constexpr,
+    stride_z_head: tl.constexpr,
+    stride_z_dim: tl.constexpr,
+    stride_out_batch: tl.constexpr,
+    stride_out_head: tl.constexpr,
+    stride_out_dim: tl.constexpr,
+    stride_scales_batch: tl.constexpr,
+    stride_scales_head: tl.constexpr,
     # Meta-parameters
+    IS_STATIC_SCALE: tl.constexpr,
     DT_SOFTPLUS: tl.constexpr,
     TIE_HDIM: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -151,6 +196,15 @@ def _selective_scan_update_kernel(
         mask &= (state_batch_idx != pad_slot_id)
     state = tl.load(state_ptrs, mask=mask, other=0.0)
 
+    # Dequantization if state is fp8
+    if tl.constexpr(state_ptr.dtype.element_ty == tl.float8e4nv):
+        if not IS_STATIC_SCALE:
+            # load scale
+            fp8_scale = tl.load(scales_ptr + pid_b * stride_scales_batch +
+                                pid_h * stride_scales_head)
+
+        state = dequant_symmetric_per_tensor(state, fp8_scale)
+
     x = tl.load(x_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
     if not TIE_HDIM:
         dt = tl.load(dt_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
@@ -185,12 +239,27 @@ def _selective_scan_update_kernel(
     mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
     if HAS_STATE_BATCH_INDICES:
         mask &= (state_batch_idx != pad_slot_id)
+
+    # Quantization before store back
+    if tl.constexpr(state_ptr.dtype.element_ty == tl.float8e4nv):
+        if IS_STATIC_SCALE:
+            state = static_quant_symmetric_per_tensor_fp8e4nv(state, fp8_scale)
+        else:
+            state, scale = dynamic_quant_symmetric_per_tensor_fp8e4nv(state)
+            # Store scale and zero point (0)
+            if pid_m == 0:
+                tl.store(
+                    scales_ptr + pid_b * stride_scales_batch +
+                    pid_h * stride_scales_head, scale)
+
     tl.store(state_ptrs, state, mask=mask)
+
     out = tl.sum(state * C[None, :], axis=1)
     if HAS_D:
         out += x * D
     if HAS_Z:
         out *= z * tl.sigmoid(z)
+
     tl.store(out_ptrs, out, mask=offs_m < dim)
 
 
@@ -271,65 +340,78 @@ def selective_state_update(state,
     grid = lambda META: (triton.cdiv(dim, META['BLOCK_SIZE_M']), batch, nheads)
     z_strides = ((z.stride(0), z.stride(1), z.stride(2)) if z is not None else
                  (0, 0, 0))
+    dt_bias_strides = ((dt_bias.stride(0),
+                        dt_bias.stride(1)) if dt_bias is not None else (0, 0))
+    D_strides = (D.stride(0), D.stride(1)) if D is not None else (0, 0)
     # We don't want autotune since it will overwrite the state
     # We instead tune by hand.
-    BLOCK_SIZE_M, num_warps = ((32, 4) if dstate <= 16 else
-                               ((16, 4) if dstate <= 32 else
-                                ((8, 4) if dstate <= 64 else
-                                 ((4, 4) if dstate <= 128 else ((4, 8))))))
+    # BLOCK_SIZE_M, num_warps = ((32, 4) if dstate <= 16 else
+    #                            ((16, 4) if dstate <= 32 else
+    #                             ((8, 4) if dstate <= 64 else
+    #                              ((4, 4) if dstate <= 128 else ((4, 8))))))
+    BLOCK_SIZE_M, num_warps, num_stages =  \
+        ((16, 2, 2) if batch > 64 else (16, 4, 2)) \
+            if state.dtype != torch.float8_e4m3fn else \
+            ((16, 2, 2) if batch > 64 else (32, 2, 1))
+
     tie_hdim = A.stride(-1) == 0 and A.stride(-2) == 0 and dt.stride(
         -1) == 0 and dt_bias.stride(-1) == 0
     with torch.cuda.device(x.device.index):
         _selective_scan_update_kernel[grid](
-            state,
-            x,
-            dt,
-            dt_bias,
-            A,
-            B,
-            C,
-            D,
-            z,
-            out,
-            state_batch_indices,
-            pad_slot_id,
-            batch,
-            nheads,
-            dim,
-            dstate,
-            nheads // ngroups,
-            state.stride(0),
-            state.stride(1),
-            state.stride(2),
-            state.stride(3),
-            x.stride(0),
-            x.stride(1),
-            x.stride(2),
-            dt.stride(0),
-            dt.stride(1),
-            dt.stride(2),
-            *(dt_bias.stride(0),
-              dt_bias.stride(1)) if dt_bias is not None else 0,
-            A.stride(0),
-            A.stride(1),
-            A.stride(2),
-            B.stride(0),
-            B.stride(1),
-            B.stride(2),
-            C.stride(0),
-            C.stride(1),
-            C.stride(2),
-            *(D.stride(0), D.stride(1)) if D is not None else 0,
-            z_strides[0],
-            z_strides[1],
-            z_strides[2],
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            dt_softplus,
-            tie_hdim,
-            BLOCK_SIZE_M,
+            state_ptr=state,
+            x_ptr=x,
+            dt_ptr=dt,
+            dt_bias_ptr=dt_bias,
+            A_ptr=A,
+            B_ptr=B,
+            C_ptr=C,
+            D_ptr=D,
+            z_ptr=z,
+            out_ptr=out,
+            state_batch_indices_ptr=state_batch_indices,
+            pad_slot_id=pad_slot_id,
+            dim=dim,
+            dstate=dstate,
+            nheads_ngroups_ratio=nheads // ngroups,
+            fp8_scale=2.0,
+            scales_ptr=None,
+            stride_state_batch=state.stride(0),
+            stride_state_head=state.stride(1),
+            stride_state_dim=state.stride(2),
+            stride_state_dstate=state.stride(3),
+            stride_x_batch=x.stride(0),
+            stride_x_head=x.stride(1),
+            stride_x_dim=x.stride(2),
+            stride_dt_batch=dt.stride(0),
+            stride_dt_head=dt.stride(1),
+            stride_dt_dim=dt.stride(2),
+            stride_dt_bias_head=dt_bias_strides[0],
+            stride_dt_bias_dim=dt_bias_strides[1],
+            stride_A_head=A.stride(0),
+            stride_A_dim=A.stride(1),
+            stride_A_dstate=A.stride(2),
+            stride_B_batch=B.stride(0),
+            stride_B_group=B.stride(1),
+            stride_B_dstate=B.stride(2),
+            stride_C_batch=C.stride(0),
+            stride_C_group=C.stride(1),
+            stride_C_dstate=C.stride(2),
+            stride_D_head=D_strides[0],
+            stride_D_dim=D_strides[1],
+            stride_z_batch=z_strides[0],
+            stride_z_head=z_strides[1],
+            stride_z_dim=z_strides[2],
+            stride_out_batch=out.stride(0),
+            stride_out_head=out.stride(1),
+            stride_out_dim=out.stride(2),
+            stride_scales_batch=0,
+            stride_scales_head=0,
+            IS_STATIC_SCALE=True,  # IS_STATIC_SCALE
+            DT_SOFTPLUS=dt_softplus,
+            TIE_HDIM=tie_hdim,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
             num_warps=num_warps,
+            num_stages=num_stages,
         )
 
 
