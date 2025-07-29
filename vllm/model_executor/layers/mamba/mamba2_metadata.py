@@ -25,6 +25,7 @@ class Mamba2Metadata:
     seq_idx: torch.Tensor
     chunk_indices: torch.Tensor
     chunk_offsets: torch.Tensor
+    chunk_inv_start: torch.Tensor
     """
     With continuous batching layout of `x` in vLLM, to enable a Triton program
     to handle a request in parallel, two supporting tensors are used
@@ -77,7 +78,7 @@ def prepare_mamba2_metadata(
     num_prefill_tokens = attn_metadata.num_prefill_tokens
 
     seq_idx = None
-    chunk_indices, chunk_offsets = None, None
+    chunk_indices, chunk_offsets, chunk_inv_start = None, None, None
     # Need flags to indicate if there are initial states
     # currently we really only support the FlashAttention backend
     has_initial_states = None
@@ -104,7 +105,7 @@ def prepare_mamba2_metadata(
         # forward and reuse them in mamba layers. If not needed, they will be
         # ignored inside mamba kernels.
         if prep_initial_states:
-            chunk_indices, chunk_offsets = \
+            chunk_indices, chunk_offsets, chunk_inv_start = \
                 _query_start_loc_to_chunk_indices_offsets(
                 query_start_loc, chunk_size, num_prefill_tokens)
 
@@ -115,6 +116,7 @@ def prepare_mamba2_metadata(
         mamba2_metadata.seq_idx = seq_idx
         mamba2_metadata.chunk_indices = chunk_indices
         mamba2_metadata.chunk_offsets = chunk_offsets
+        mamba2_metadata.chunk_inv_start = chunk_inv_start
         # We use 1 reset flag:
         #  * mamba2_metadata.cu_seqlen is None
         #      update config specific to (each input)
@@ -127,7 +129,8 @@ def prepare_mamba2_metadata(
                           chunk_size=chunk_size,
                           seq_idx=seq_idx,
                           chunk_indices=chunk_indices,
-                          chunk_offsets=chunk_offsets)
+                          chunk_offsets=chunk_offsets,
+                          chunk_inv_start=chunk_inv_start)
 
 
 def update_metadata(x: torch.Tensor, query_start_loc: torch.Tensor,

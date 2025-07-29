@@ -269,9 +269,9 @@ def _chunk_scan_fwd_kernel(
             # - c_off == 0 is a passthrough
             dA_cs_m_boundary = tl.load(
                 dA_cumsum_ptr +
-                (pid_m * BLOCK_SIZE_M + c_off - 1) * stride_dA_cs_csize,
-                mask=(((pid_m * BLOCK_SIZE_M + c_off - 1) > -1)
-                      and ((pid_m * BLOCK_SIZE_M + c_off) < chunk_size)),
+                (c_off - 1) * stride_dA_cs_csize,
+                mask=(((c_off - 1) > -1)
+                      and ((c_off) < chunk_size)),
                 other=0.0).to(tl.float32)
     else:
         # - handle seq idx when HAS_INITSTATES==False
