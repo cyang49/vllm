@@ -93,6 +93,7 @@ def _selective_scan_update_kernel(
     z_ptr,
     out_ptr,
     state_batch_indices_ptr,
+    scales_ptr,
     pad_slot_id: tl.constexpr,
     # Matrix dimensions
     dim: tl.constexpr,
@@ -100,7 +101,6 @@ def _selective_scan_update_kernel(
     nheads_ngroups_ratio: tl.constexpr,
     # Quantization
     fp8_scale: tl.constexpr,
-    scales_ptr: tl.constexpr,
     # Strides
     stride_state_batch: tl.constexpr,
     stride_state_head: tl.constexpr,
@@ -263,19 +263,23 @@ def _selective_scan_update_kernel(
     tl.store(out_ptrs, out, mask=offs_m < dim)
 
 
-def selective_state_update(state,
-                           x,
-                           dt,
-                           A,
-                           B,
-                           C,
-                           D=None,
-                           z=None,
-                           dt_bias=None,
-                           dt_softplus=False,
-                           state_batch_indices=None,
-                           pad_slot_id=PAD_SLOT_ID,
-                           out=None):
+def selective_state_update(
+    state,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    D=None,
+    z=None,
+    dt_bias=None,
+    dt_softplus=False,
+    state_batch_indices=None,
+    pad_slot_id=PAD_SLOT_ID,
+    out=None,
+    fp8_static_scale=None,
+    fp8_scales=None,
+):
     """
     Argument:
         state: (batch, dim, dstate) or (batch, nheads, dim, dstate)
@@ -335,6 +339,15 @@ def selective_state_update(state,
         assert dt_bias.shape == (nheads, dim)
     if state_batch_indices is not None:
         assert state_batch_indices.shape == (batch, )
+
+    IS_STATIC_SCALE = True
+    if state.dtype == torch.float8_e4m3fn:
+        if fp8_static_scale is not None:
+            assert fp8_scales is None
+        else:
+            IS_STATIC_SCALE = False
+            assert fp8_scales is not None
+
     assert out.shape == x.shape
 
     grid = lambda META: (triton.cdiv(dim, META['BLOCK_SIZE_M']), batch, nheads)
@@ -343,6 +356,9 @@ def selective_state_update(state,
     dt_bias_strides = ((dt_bias.stride(0),
                         dt_bias.stride(1)) if dt_bias is not None else (0, 0))
     D_strides = (D.stride(0), D.stride(1)) if D is not None else (0, 0)
+    scales_strides = ((fp8_scales.stride(0),
+                       fp8_scales.stride(1)) if fp8_scales is not None else
+                      (0, 0))
     # We don't want autotune since it will overwrite the state
     # We instead tune by hand.
     # BLOCK_SIZE_M, num_warps = ((32, 4) if dstate <= 16 else
@@ -373,8 +389,8 @@ def selective_state_update(state,
             dim=dim,
             dstate=dstate,
             nheads_ngroups_ratio=nheads // ngroups,
-            fp8_scale=2.0,
-            scales_ptr=None,
+            fp8_scale=fp8_static_scale,
+            scales_ptr=fp8_scales,
             stride_state_batch=state.stride(0),
             stride_state_head=state.stride(1),
             stride_state_dim=state.stride(2),
@@ -404,9 +420,9 @@ def selective_state_update(state,
             stride_out_batch=out.stride(0),
             stride_out_head=out.stride(1),
             stride_out_dim=out.stride(2),
-            stride_scales_batch=0,
-            stride_scales_head=0,
-            IS_STATIC_SCALE=True,  # IS_STATIC_SCALE
+            stride_scales_batch=scales_strides[0],
+            stride_scales_head=scales_strides[1],
+            IS_STATIC_SCALE=IS_STATIC_SCALE,
             DT_SOFTPLUS=dt_softplus,
             TIE_HDIM=tie_hdim,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
