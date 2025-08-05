@@ -349,14 +349,6 @@ def selective_state_update(
     if state_batch_indices is not None:
         assert state_batch_indices.shape == (batch, )
 
-    IS_STATIC_SCALE = True
-    if state.dtype == torch.float8_e4m3fn:
-        if fp8_static_scale is not None:
-            assert fp8_scales is None
-        else:
-            IS_STATIC_SCALE = False
-            assert fp8_scales is not None
-
     assert out.shape == x.shape
 
     grid = lambda META: (triton.cdiv(dim, META['BLOCK_SIZE_M']), batch, nheads)
@@ -382,8 +374,7 @@ def selective_state_update(
     shared_quant_ratio = 1
     if state.dtype == torch.float8_e4m3fn:
         assert is_fp8_static_scale is not None
-        assert fp8_scales is not None
-        assert fp8_scales.ndim > 0
+        assert (fp8_scales is not None) and (fp8_scales.ndim > 0)
 
         for i in range(fp8_scales.ndim):
             scales_strides[i] = fp8_scales.stride(i)
@@ -391,6 +382,8 @@ def selective_state_update(
         if fp8_scales.ndim == 3:  # per group
             assert ((fp8_scales.shape[0], fp8_scales.shape[1]) == (batch,
                                                                    nheads))
+            # sanity check quant group granularity compatibility with
+            # kernel tiling size
             quant_ngroups = fp8_scales.shape[-1]
             quant_group_size = dim // quant_ngroups
             assert dim % quant_ngroups == 0
@@ -399,8 +392,10 @@ def selective_state_update(
             # number of mblocks that share the same scaling factor
             shared_quant_ratio = quant_group_size // BLOCK_SIZE_M
         else:
-            assert is_fp8_static_scale
             assert fp8_scales.ndim == 1 or fp8_scales.ndim == 2
+            assert is_fp8_static_scale, \
+                "must be static scale for per-tensor or per-head quantization"
+
             if fp8_scales.ndim == 1:  # per batch
                 assert fp8_scales.shape == (batch, )
             elif fp8_scales.ndim == 2:  # per head
