@@ -244,6 +244,14 @@ def _selective_scan_update_kernel(
     if HAS_STATE_BATCH_INDICES:
         mask &= (state_batch_idx != pad_slot_id)
 
+    out = tl.sum(state * C[None, :], axis=1)
+    if HAS_D:
+        out += x * D
+    if HAS_Z:
+        out *= z * tl.sigmoid(z)
+
+    tl.store(out_ptrs, out, mask=offs_m < dim)
+
     # Quantization before store back
     if tl.constexpr(state_ptr.dtype.element_ty == tl.float8e4nv):
         if IS_STATIC_SCALE:
@@ -256,14 +264,6 @@ def _selective_scan_update_kernel(
                 (pid_m // shared_quant_ratio) * stride_scales_group, scale)
 
     tl.store(state_ptrs, state, mask=mask)
-
-    out = tl.sum(state * C[None, :], axis=1)
-    if HAS_D:
-        out += x * D
-    if HAS_Z:
-        out *= z * tl.sigmoid(z)
-
-    tl.store(out_ptrs, out, mask=offs_m < dim)
 
 
 def selective_state_update(
@@ -309,6 +309,8 @@ def selective_state_update(
         out: Preallocated ssm output tensor. Assume same shape as x. 
              In-place updated.
     """
+    NO_HEADS = x.dim() == 2
+
     if state.dim() == 3:
         state = state.unsqueeze(1)
     if x.dim() == 2:
@@ -375,6 +377,8 @@ def selective_state_update(
     if state.dtype == torch.float8_e4m3fn:
         assert is_fp8_static_scale is not None
         assert (fp8_scales is not None) and (fp8_scales.ndim > 0)
+        if NO_HEADS:
+            fp8_scales.unsqueeze_(1)
 
         for i in range(fp8_scales.ndim):
             scales_strides[i] = fp8_scales.stride(i)
