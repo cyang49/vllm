@@ -8,6 +8,7 @@ from einops import rearrange, repeat
 
 from tests.kernels.utils import opcheck
 from vllm import _custom_ops as ops  # noqa: F401
+from vllm._custom_ops import scaled_fp8_quant
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
     selective_scan_fn, selective_state_update)
@@ -398,6 +399,97 @@ def test_selective_state_update(dim, dstate, has_z, itype):
 
     assert torch.allclose(state, state_ref, rtol=rtol, atol=atol)
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("itype",
+                         [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("has_z", [False, True])
+@pytest.mark.parametrize("dstate", [16, 32, 64])
+@pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
+@pytest.mark.parametrize("batch_size", [
+    1,
+])
+@pytest.mark.parametrize("quant_granularity", ["token"])
+@pytest.mark.parametrize("is_static_fp8", [True])
+def test_selective_state_update_quant(dim, dstate, has_z, itype, batch_size,
+                                      quant_granularity, is_static_fp8):
+    device = "cuda"
+    rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 1e-2)
+    if itype == torch.bfloat16:
+        rtol, atol = 1e-2, 5e-2
+        if torch.version.hip:
+            atol *= 2
+    # set seed
+    current_platform.seed_everything(0)
+
+    state = torch.randn(batch_size, dim, dstate, dtype=itype, device=device)
+    x = torch.randn(batch_size, dim, device=device, dtype=itype)
+    out = torch.empty_like(x)
+    dt = torch.randn(batch_size, dim, device=device, dtype=itype)
+    dt_bias = torch.rand(dim, device=device) - 4.0
+    A = -torch.rand(dim, dstate, device=device) - 1.0
+    B = torch.randn(batch_size, dstate, device=device)
+    C = torch.randn(batch_size, dstate, device=device)
+    D = torch.randn(dim, device=device)
+    z = torch.randn_like(x) if has_z else None
+
+    if quant_granularity == "token":
+        state_fp8, scales = scaled_fp8_quant(state.view(batch_size, -1),
+                                             use_per_token_if_dynamic=True)
+        scales = scales.squeeze(1)
+
+        state_fp8 = state_fp8.view(batch_size, dim, dstate)
+        state_ref = state_fp8.to(itype) * scales
+    elif quant_granularity == "group":
+        group_size = 16
+        print(f"{state.shape=}")
+        state_fp8, scales = scaled_fp8_quant(state.view(-1, group_size),
+                                             use_per_token_if_dynamic=True)
+        # scales = scales.squeeze(1) # ngroups
+        print(f"{state_fp8.shape=}")
+        print(f"{scales.shape=}")
+        state_ref = (state_fp8.to(itype) * scales).view(
+            batch_size, dim, dstate)
+        state_fp8 = state_fp8.view(batch_size, dim, dstate)
+        scales = scales.view(batch_size, -1)  # batch, ngroups_per_token
+    # print("===Before===")
+    print(f"{state_fp8=}")
+    print(f"{scales=}")
+    # print(f"{scales.dtype=}")
+    selective_state_update(state_fp8,
+                           x,
+                           dt,
+                           A,
+                           B,
+                           C,
+                           D=D,
+                           z=z,
+                           dt_bias=dt_bias,
+                           dt_softplus=True,
+                           out=out,
+                           is_fp8_static_scale=is_static_fp8,
+                           fp8_scales=scales)
+
+    # print("===After===")
+    print(f"{state_fp8=}")
+    print(f"{scales=}")
+    # print(f"{scales.dtype=}")
+    print("===Before===")
+    print(f"{state_ref=}")
+    out_ref = selective_state_update_ref(state_ref,
+                                         x,
+                                         dt,
+                                         A,
+                                         B,
+                                         C,
+                                         D=D,
+                                         z=z,
+                                         dt_bias=dt_bias,
+                                         dt_softplus=True)
+    # print("===After===")
+    # print(f"{state_ref=}")
+    # torch.testing.assert_close(state, state_ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize('wtype', [torch.float32])
