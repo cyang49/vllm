@@ -409,10 +409,19 @@ def test_selective_state_update(dim, dstate, has_z, itype):
 @pytest.mark.parametrize("batch_size", [
     1,
 ])
-@pytest.mark.parametrize("quant_granularity", ["token"])
-@pytest.mark.parametrize("is_static_fp8", [True])
+@pytest.mark.parametrize("quant_granularity,group_size", [("token", None),
+                                                          ("group", 16),
+                                                          ("group", 32),
+                                                          ("group", 64)])
+@pytest.mark.parametrize("is_static_fp8", [True, False])
 def test_selective_state_update_quant(dim, dstate, has_z, itype, batch_size,
-                                      quant_granularity, is_static_fp8):
+                                      quant_granularity, is_static_fp8,
+                                      group_size):
+    if quant_granularity == "token" and not is_static_fp8:
+        pytest.skip()
+    if quant_granularity == "group" and group_size > dstate:
+        pytest.skip()
+
     device = "cuda"
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 1e-2)
     if itype == torch.bfloat16:
@@ -436,26 +445,18 @@ def test_selective_state_update_quant(dim, dstate, has_z, itype, batch_size,
     if quant_granularity == "token":
         state_fp8, scales = scaled_fp8_quant(state.view(batch_size, -1),
                                              use_per_token_if_dynamic=True)
-        scales = scales.squeeze(1)
-
+        scales = scales.squeeze(1)  # [batch,]
         state_fp8 = state_fp8.view(batch_size, dim, dstate)
         state_ref = state_fp8.to(itype) * scales
     elif quant_granularity == "group":
-        group_size = 16
-        print(f"{state.shape=}")
         state_fp8, scales = scaled_fp8_quant(state.view(-1, group_size),
                                              use_per_token_if_dynamic=True)
-        # scales = scales.squeeze(1) # ngroups
-        print(f"{state_fp8.shape=}")
-        print(f"{scales.shape=}")
         state_ref = (state_fp8.to(itype) * scales).view(
             batch_size, dim, dstate)
         state_fp8 = state_fp8.view(batch_size, dim, dstate)
-        scales = scales.view(batch_size, -1)  # batch, ngroups_per_token
-    # print("===Before===")
-    print(f"{state_fp8=}")
-    print(f"{scales=}")
-    # print(f"{scales.dtype=}")
+        scales = scales.view(batch_size, dim,
+                             -1)  # [batch, dim, ngroups_per_row]
+
     selective_state_update(state_fp8,
                            x,
                            dt,
@@ -470,12 +471,6 @@ def test_selective_state_update_quant(dim, dstate, has_z, itype, batch_size,
                            is_fp8_static_scale=is_static_fp8,
                            fp8_scales=scales)
 
-    # print("===After===")
-    print(f"{state_fp8=}")
-    print(f"{scales=}")
-    # print(f"{scales.dtype=}")
-    print("===Before===")
-    print(f"{state_ref=}")
     out_ref = selective_state_update_ref(state_ref,
                                          x,
                                          dt,
@@ -486,8 +481,6 @@ def test_selective_state_update_quant(dim, dstate, has_z, itype, batch_size,
                                          z=z,
                                          dt_bias=dt_bias,
                                          dt_softplus=True)
-    # print("===After===")
-    # print(f"{state_ref=}")
     # torch.testing.assert_close(state, state_ref, rtol=rtol, atol=atol)
     torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
 

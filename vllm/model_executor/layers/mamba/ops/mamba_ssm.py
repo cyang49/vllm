@@ -134,6 +134,7 @@ def _selective_scan_update_kernel(
     stride_out_dim: tl.constexpr,
     stride_scales_batch: tl.constexpr,
     stride_scales_head: tl.constexpr,
+    stride_scales_dim: tl.constexpr,
     stride_scales_group: tl.constexpr,
     # Meta-parameters
     IS_STATIC_SCALE: tl.constexpr,  # scaling factors are read-only
@@ -199,6 +200,7 @@ def _selective_scan_update_kernel(
     state = tl.load(state_ptrs, mask=mask, other=0.0)
 
     # Dequantization if state is fp8
+
     if tl.constexpr(state_ptr.dtype.element_ty == tl.float8e4nv):
         if quant_group_size == -1:  # per-token or per-head
             fp8_scale = tl.load(scales_ptr + pid_b * stride_scales_batch +
@@ -206,29 +208,23 @@ def _selective_scan_update_kernel(
             state = dequant_symmetric_per_tensor(state, fp8_scale)
         else:
             # BLOCK_SIZE_DSTATE can be a power of 2 value >= dstate
-            tl.static_assert(quant_group_size <= BLOCK_SIZE_DSTATE)
             tl.static_assert(BLOCK_SIZE_DSTATE % quant_group_size == 0)
-            tl.static_assert(dstate <= BLOCK_SIZE_DSTATE)
-
+            # ngroups_per_row = tl.cdiv(BLOCK_SIZE_DSTATE, quant_group_size)
             offs_ngroups = tl.arange(0,
                                      (BLOCK_SIZE_DSTATE // quant_group_size))
-            mask_ngroups = offs_ngroups < (dstate // quant_group_size)
-            # Input scales are read only. The logic here should work
-            # for different quantization granularities, assuming
-            # that 0 strides are set correctly. E.g.
-            # if quantization is per head, where stride_scales_group==0
-            # results in the threads of the same head would use the same
-            # scaling factor
-            # fp8_scale: [(BLOCK_SIZE_DSTATE // quant_group_size)]
+            # fp8_scale: [BLOCK_SIZE_M, ngroups_per_row]
             fp8_scale = tl.load(
                 scales_ptr + pid_b * stride_scales_batch +
                 pid_h * stride_scales_head +
-                (pid_m * dstate + offs_ngroups * stride_scales_group),
-                mask=mask_ngroups,
+                offs_m[:, None] * stride_scales_dim +
+                offs_ngroups[None, :] * stride_scales_group,
+                mask=((offs_m[:, None] < dim)
+                      &
+                      (offs_ngroups[None, :] < (dstate // quant_group_size))),
                 other=0.0)
             state = dequant_symmetric_per_group(state, fp8_scale,
                                                 quant_group_size)
-    # tl.store(state_ptrs, state, mask=mask)
+
     x = tl.load(x_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
     if not TIE_HDIM:
         dt = tl.load(dt_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
@@ -281,19 +277,19 @@ def _selective_scan_update_kernel(
                 state, _ = quant_symmetric_per_group_fp8e4nv(
                     state, quant_group_size, fp8_scale)
         else:  # dynamic
-            if quant_group_size == -1:
-                state, scale = quant_symmetric_per_tensor_fp8e4nv(state)
-                tl.store(
-                    scales_ptr + pid_b * stride_scales_batch +
-                    pid_h * stride_scales_head, scale)
-            else:
-                state, scale = quant_symmetric_per_group_fp8e4nv(
-                    state, quant_group_size)
-                tl.store(scales_ptr + pid_b * stride_scales_batch +
-                         pid_h * stride_scales_head +
-                         (pid_m * dstate + offs_ngroups * stride_scales_group),
-                         scale,
-                         mask=mask_ngroups)
+            tl.static_assert(quant_group_size != -1)
+            state, scale = quant_symmetric_per_group_fp8e4nv(
+                state, quant_group_size)
+            tl.store(
+                scales_ptr + pid_b * stride_scales_batch +
+                pid_h * stride_scales_head +
+                offs_m[:, None] * stride_scales_dim +
+                offs_ngroups[None, :] * stride_scales_group,
+                scale,
+                mask=((offs_m[:, None] < dim)
+                      &
+                      (offs_ngroups[None, :] < (dstate // quant_group_size))),
+            )
 
     tl.store(state_ptrs, state, mask=mask)
 
@@ -404,30 +400,34 @@ def selective_state_update(
             ((16, 2, 2) if batch > 64 else (32, 2, 1))
 
     # FP8 quantization metadata
-    scales_strides = [0, 0, 0]
-    # shared_quant_ratio = 1
+    scales_strides = [0 for _ in range(state.ndim)]
     quant_group_size = -1
     if state.dtype == torch.float8_e4m3fn:
         assert is_fp8_static_scale is not None
         assert (fp8_scales is not None) and (fp8_scales.ndim > 0)
+
         if NO_HEADS:
             fp8_scales.unsqueeze_(1)
 
         for i in range(fp8_scales.ndim):
             scales_strides[i] = fp8_scales.stride(i)
 
-        if fp8_scales.ndim == 3:  # per group
-            assert ((fp8_scales.shape[0], fp8_scales.shape[1]) == (batch,
-                                                                   nheads))
-            # sanity check quant group granularity compatibility with
-            # kernel tiling size
+        if fp8_scales.ndim == state.ndim:  # per group
+            assert fp8_scales.ndim == 4
+            assert ((fp8_scales.shape[0], fp8_scales.shape[1],
+                     fp8_scales.shape[2]) == (batch, nheads, dim))
             quant_ngroups = fp8_scales.shape[-1]
-            quant_group_size = (dim * dstate) // quant_ngroups
-            assert (dim * dstate) % quant_ngroups == 0
-            print(f"{quant_group_size=}")
-            print(f"{BLOCK_SIZE_M=}")
-            assert (((BLOCK_SIZE_M * dstate) >= quant_group_size)
-                    and (((BLOCK_SIZE_M * dstate) % quant_group_size) == 0))
+            quant_group_size = dstate // quant_ngroups
+            # Simplifying assumption for quant_group_size
+            assert quant_group_size <= dstate
+            assert dstate % quant_group_size == 0
+            # print(f"{quant_group_size=}")
+            # print(f"{BLOCK_SIZE_M=}")
+            # print(f"{fp8_scales.shape=}")
+            # print(f"{fp8_scales.stride(0)=}")
+            # print(f"{fp8_scales.stride(1)=}")
+            # print(f"{fp8_scales.stride(2)=}")
+            # print(f"{fp8_scales.stride(3)=}")
         else:
             assert fp8_scales.ndim == 1 or fp8_scales.ndim == 2
             # No support for dynamic quantization across thread blocks
@@ -492,7 +492,8 @@ def selective_state_update(
             stride_out_dim=out.stride(2),
             stride_scales_batch=scales_strides[0],
             stride_scales_head=scales_strides[1],
-            stride_scales_group=scales_strides[2],
+            stride_scales_dim=scales_strides[2],
+            stride_scales_group=scales_strides[3],
             IS_STATIC_SCALE=is_fp8_static_scale,
             DT_SOFTPLUS=dt_softplus,
             TIE_HDIM=tie_hdim,
