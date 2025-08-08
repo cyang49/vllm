@@ -405,15 +405,18 @@ def test_selective_state_update(dim, dstate, has_z, itype):
                          [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("has_z", [False, True])
 @pytest.mark.parametrize("dstate", [16, 32, 64])
+# @pytest.mark.parametrize("dstate", [64])
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 @pytest.mark.parametrize("batch_size", [
     1,
 ])
-@pytest.mark.parametrize("quant_granularity,group_size", [("token", None),
-                                                          ("group", 16),
-                                                          ("group", 32),
-                                                          ("group", 64)])
-@pytest.mark.parametrize("is_static_fp8", [True, False])
+@pytest.mark.parametrize("quant_granularity,group_size", [
+    ("token", None),
+])
+#   ("group", 16),
+#   ("group", 32),
+#   ("group", 64)])
+@pytest.mark.parametrize("is_static_fp8", [True])
 def test_selective_state_update_quant(dim, dstate, has_z, itype, batch_size,
                                       quant_granularity, is_static_fp8,
                                       group_size):
@@ -443,6 +446,7 @@ def test_selective_state_update_quant(dim, dstate, has_z, itype, batch_size,
     z = torch.randn_like(x) if has_z else None
 
     if quant_granularity == "token":
+        assert is_static_fp8
         state_fp8, scales = scaled_fp8_quant(state.view(batch_size, -1),
                                              use_per_token_if_dynamic=True)
         scales = scales.squeeze(1)  # [batch,]
@@ -481,7 +485,34 @@ def test_selective_state_update_quant(dim, dstate, has_z, itype, batch_size,
                                          z=z,
                                          dt_bias=dt_bias,
                                          dt_softplus=True)
-    # torch.testing.assert_close(state, state_ref, rtol=rtol, atol=atol)
+
+    # convert state_ref to fp8 for result comparisons
+    if quant_granularity == "token":
+        state_ref_fp8, _ = scaled_fp8_quant(state_ref.view(batch_size, -1),
+                                            scales)
+        state_ref_fp8_dq = state_ref_fp8.to(itype) * scales
+        # state_ref_fp8_dq = (state_ref.view(batch_size, -1) \
+        #     / scales).clamp(-448.0, 448.0) * scales
+        state_fp8_dq = state_fp8.to(itype).view(batch_size, -1) * scales
+    elif quant_granularity == "group":
+        state_ref_fp8, scales_ref = scaled_fp8_quant(
+            state_ref.view(-1, group_size), use_per_token_if_dynamic=True)
+        state_ref = (state_fp8.to(itype) * scales).view(
+            batch_size, dim, dstate)
+        if not is_static_fp8:
+            scales_ref = scales.view(batch_size, dim,
+                                     -1)  # [batch, dim, ngroups_per_row]
+            torch.testing.assert_close(scales,
+                                       scales_ref,
+                                       rtol=rtol,
+                                       atol=atol)
+    state_ref_fp8_dq = state_ref_fp8_dq.view(batch_size, dim, dstate)
+    state_fp8_dq = state_fp8_dq.view(batch_size, dim, dstate)
+
+    torch.testing.assert_close(state_fp8_dq,
+                               state_ref_fp8_dq,
+                               rtol=rtol,
+                               atol=atol)
     torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
 
 

@@ -421,13 +421,6 @@ def selective_state_update(
             # Simplifying assumption for quant_group_size
             assert quant_group_size <= dstate
             assert dstate % quant_group_size == 0
-            # print(f"{quant_group_size=}")
-            # print(f"{BLOCK_SIZE_M=}")
-            # print(f"{fp8_scales.shape=}")
-            # print(f"{fp8_scales.stride(0)=}")
-            # print(f"{fp8_scales.stride(1)=}")
-            # print(f"{fp8_scales.stride(2)=}")
-            # print(f"{fp8_scales.stride(3)=}")
         else:
             assert fp8_scales.ndim == 1 or fp8_scales.ndim == 2
             # No support for dynamic quantization across thread blocks
