@@ -140,6 +140,7 @@ class Mamba2AttentionMetadataBuilder(
         return update_metadata(
             attn_metadata) if num_prefills > 0 else attn_metadata
 
+
 def _query_start_loc_to_chunk_indices_offsets(query_start_loc: torch.Tensor,
                                               chunk_size: int,
                                               total_seqlens: int):
@@ -228,4 +229,3 @@ def update_metadata(mamba2_metadata):
             mamba2_metadata.token_chunk_offset_ptr)  # type: ignore
     mamba2_metadata.nums_dict = nums_dict
     return mamba2_metadata
-
