@@ -221,7 +221,7 @@ def test_mamba_chunk_scan_single_example(d_head, n_heads, seq_len_chunk_size,
     cu_seqlens = torch.tensor((0, seqlen), device='cuda').cumsum(dim=0)
     seq_idx = torch.zeros(seqlen, dtype=torch.int32, device=cu_seqlens.device)
 
-    chunk_indices, chunk_offsets = \
+    chunk_indices, chunk_offsets, chunk_inv_start = \
             _query_start_loc_to_chunk_indices_offsets(
                 cu_seqlens, chunk_size, cu_seqlens[-1])
 
@@ -232,18 +232,20 @@ def test_mamba_chunk_scan_single_example(d_head, n_heads, seq_len_chunk_size,
     B = B.squeeze(0)
     C = C.squeeze(0)
     Y = torch.empty_like(X)
-    final_state = mamba_chunk_scan_combined_varlen(X,
-                                                   dt,
-                                                   A,
-                                                   B,
-                                                   C,
-                                                   chunk_size,
-                                                   D=None,
-                                                   cu_seqlens=cu_seqlens,
-                                                   seq_idx=seq_idx,
-                                                   chunk_indices=chunk_indices,
-                                                   chunk_offsets=chunk_offsets,
-                                                   out=Y)
+    final_state = mamba_chunk_scan_combined_varlen(
+        X,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D=None,
+        cu_seqlens=cu_seqlens,
+        seq_idx=seq_idx,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        chunk_inv_start=chunk_inv_start,
+        out=Y)
 
     # just test the last in sequence
     torch.testing.assert_close(Y[-1], Y_min[0, -1], atol=atol, rtol=rtol)
@@ -310,7 +312,7 @@ def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases,
                 cases, num_examples, seqlen, last_taken, exhausted, n_heads,
                 d_head, itype):
 
-        chunk_indices, chunk_offsets = \
+        chunk_indices, chunk_offsets, chunk_inv_start = \
             _query_start_loc_to_chunk_indices_offsets(
                 cu_seqlens, chunk_size, cu_seqlens[-1])
 
@@ -327,6 +329,7 @@ def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases,
             seq_idx=seq_idx,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
+            chunk_inv_start=chunk_inv_start,
             initial_states=states,
             out=Y,
         )
