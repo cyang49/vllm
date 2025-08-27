@@ -321,6 +321,7 @@ class Plamo2MambaMixer(nn.Module):
                 chunk_indices=mamba2_metadata.chunk_indices,
                 chunk_offsets=mamba2_metadata.chunk_offsets,
                 cu_seqlens=mamba2_metadata.query_start_loc_p,
+                chunk_inv_start=mamba2_metadata.chunk_inv_start_p,
                 initial_states=initial_states,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
