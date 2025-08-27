@@ -44,7 +44,7 @@ def _mamba_chunk_scan_combined_fwd(x,
                                    cu_seqlens=None,
                                    dt_softplus=False,
                                    dt_limit=(0.0, float("inf")),
-                                   fused=False,
+                                   fused=True,
                                    state_dtype=None):
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     seqlen, nheads, headdim = x.shape
