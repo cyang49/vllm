@@ -95,7 +95,6 @@ def _selective_scan_update_kernel(
     out_ptr,
     state_batch_indices_ptr,
     scales_ptr,
-    # shared_quant_ratio: tl.constexpr,
     quant_group_size: tl.constexpr,
     pad_slot_id: tl.constexpr,
     # Matrix dimensions
@@ -200,7 +199,6 @@ def _selective_scan_update_kernel(
     state = tl.load(state_ptrs, mask=mask, other=0.0)
 
     # Dequantization if state is fp8
-
     if tl.constexpr(state_ptr.dtype.element_ty == tl.float8e4nv):
         if quant_group_size == -1:  # per-token or per-head
             fp8_scale = tl.load(scales_ptr + pid_b * stride_scales_batch +
@@ -209,7 +207,6 @@ def _selective_scan_update_kernel(
         else:
             # BLOCK_SIZE_DSTATE can be a power of 2 value >= dstate
             tl.static_assert(BLOCK_SIZE_DSTATE % quant_group_size == 0)
-            # ngroups_per_row = tl.cdiv(BLOCK_SIZE_DSTATE, quant_group_size)
             offs_ngroups = tl.arange(0,
                                      (BLOCK_SIZE_DSTATE // quant_group_size))
             # fp8_scale: [BLOCK_SIZE_M, ngroups_per_row]
@@ -452,7 +449,6 @@ def selective_state_update(
             dstate=dstate,
             nheads_ngroups_ratio=nheads // ngroups,
             scales_ptr=fp8_scales,
-            # shared_quant_ratio=shared_quant_ratio,
             quant_group_size=quant_group_size,
             stride_state_batch=state.stride(0),
             stride_state_head=state.stride(1),

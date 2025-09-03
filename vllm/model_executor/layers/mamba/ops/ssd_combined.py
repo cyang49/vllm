@@ -115,6 +115,7 @@ def _mamba_chunk_scan_combined_fwd(x,
         rearrange(states,
                   "... p n -> ... (p n)"),  # (nchunks, nheads, headdim*dstate)
         dA_cumsum[:, :, -1],  # (nheads, nchunks)
+        dstate=dstate,
         initial_states=rearrange(initial_states, "... p n -> ... (p n)")
         if initial_states is not None else
         None,  # (batch, nheads, headdim*dstate)
