@@ -314,41 +314,50 @@ def _chunk_scan_fwd_kernel(
                         other=0.0)
 
             # Dynamic branch for loading init_state which may be a different dtype
-            # from prev_states. use_init==True implies HAS_INITSTATES
-            if use_init:
-                init_states = tl.load(init_states_ptrs,
-                                      mask=(offs_k_dstate[:, None] < dstate) &
-                                      (offs_n[None, :] < hdim),
-                                      other=0.0)
-                # Dequantization if state is fp8
-                if tl.constexpr(
-                        init_states_ptrs.dtype.element_ty == tl.float8e4nv):
-                    if quant_group_size == -1:  # per-token or per-head
-                        fp8_scale = tl.load(scales_ptr)
-                        init_states = dequant_symmetric_per_tensor(
-                            init_states, fp8_scale)
-                    else:
-                        # BLOCK_SIZE_DSTATE can be a power of 2 value >= dstate
-                        tl.static_assert(BLOCK_SIZE_DSTATE %
-                                         quant_group_size == 0)
-                        tl.static_assert(dstate % quant_group_size == 0)
-                        offs_k_ngroups = tl.arange(
-                            0, (BLOCK_SIZE_DSTATE // quant_group_size))
-                        # fp8_scale: [, ngroups_per_row]
-                        fp8_scale = tl.load(
-                            scales_ptr + offs_n[:, None] * stride_scales_dim +
-                            offs_k_ngroups[None, :] * stride_scales_group,
-                            mask=((offs_n[:, None] < hdim)
-                                  & (offs_k_ngroups[None, :]
-                                     < (dstate // quant_group_size))),
-                            other=0.0)
-                        # NOTE: init_states is [K, N]
-                        init_states = dequant_symmetric_per_group(
-                            init_states.T,
-                            fp8_scale,
-                            quant_group_size,
-                        ).T
-                prev_states = init_states.to(states_ptr.dtype.element_ty)
+            # from prev_states.
+            if HAS_INITSTATES:
+                if use_init:
+                    init_states = tl.load(
+                        init_states_ptrs,
+                        mask=(offs_k_dstate[:, None] < dstate) &
+                        (offs_n[None, :] < hdim),
+                        other=0.0)
+                    # Dequantization if state is fp8
+                    if tl.constexpr(init_states_ptrs.dtype.element_ty ==
+                                    tl.float8e4nv):
+                        if quant_group_size == -1:  # per-token or per-head
+                            fp8_scale = tl.load(scales_ptr)
+                            init_states = dequant_symmetric_per_tensor(
+                                init_states, fp8_scale)
+                        else:
+                            # BLOCK_SIZE_DSTATE can be a power of 2 value >= dstate
+                            tl.static_assert(BLOCK_SIZE_DSTATE %
+                                             quant_group_size == 0)
+                            tl.static_assert(dstate % quant_group_size == 0)
+                            offs_k_ngroups = tl.arange(
+                                0, (BLOCK_SIZE_DSTATE // quant_group_size))
+                            # fp8_scale: [, ngroups_per_row]
+                            fp8_scale = tl.load(
+                                scales_ptr +
+                                offs_n[:, None] * stride_scales_dim +
+                                offs_k_ngroups[None, :] * stride_scales_group,
+                                mask=((offs_n[:, None] < hdim)
+                                      & (offs_k_ngroups[None, :]
+                                         < (dstate // quant_group_size))),
+                                other=0.0)
+                            # NOTE: init_states is [K, N]
+                            init_states = dequant_symmetric_per_group(
+                                init_states.T,
+                                fp8_scale,
+                                quant_group_size,
+                            ).T
+                    prev_states = init_states.to(states_ptr.dtype.element_ty)
+                else:  # verbosity due to the forbidden mixing static and dynamic flags
+                    prev_states = tl.load(
+                        prev_states_ptrs,
+                        mask=(offs_k_dstate[:, None] < dstate) &
+                        (offs_n[None, :] < hdim),
+                        other=0.0)
             else:
                 prev_states = tl.load(prev_states_ptrs,
                                       mask=(offs_k_dstate[:, None] < dstate) &
@@ -362,46 +371,56 @@ def _chunk_scan_fwd_kernel(
                             mask=(offs_m[:, None] < chunk_size_limit) &
                             (offs_k_dstate[None, :] < dstate - k),
                             other=0.0)
+                if HAS_INITSTATES:
+                    if use_init:
+                        init_states = tl.load(
+                            init_states_ptrs,
+                            mask=(offs_k_dstate[:, None] < dstate - k) &
+                            (offs_n[None, :] < hdim),
+                            other=0.0)
+                        init_states_ptrs += BLOCK_SIZE_K
+                        # Dequantization if state is fp8
+                        if tl.constexpr(init_states_ptrs.dtype.element_ty ==
+                                        tl.float8e4nv):
+                            if quant_group_size == -1:  # per-token or per-head
+                                fp8_scale = tl.load(scales_ptr)
+                                init_states = dequant_symmetric_per_tensor(
+                                    init_states, fp8_scale)
+                            else:
+                                # BLOCK_SIZE_K can be a power of 2 value >= dstate
+                                tl.static_assert(BLOCK_SIZE_K %
+                                                 quant_group_size == 0)
+                                tl.static_assert(dstate %
+                                                 quant_group_size == 0)
+                                offs_k_ngroups = tl.arange(
+                                    0, (BLOCK_SIZE_K // quant_group_size))
+                                # fp8_scale: [, ngroups_per_row_block]
+                                fp8_scale = tl.load(
+                                    scales_ptr +
+                                    offs_n[:, None] * stride_scales_dim +
+                                    offs_k_ngroups[None, :] *
+                                    stride_scales_group,
+                                    mask=((offs_n[:, None] < hdim)
+                                          & (offs_k_ngroups[None, :]
+                                             < (dstate // quant_group_size))),
+                                    other=0.0)
+                                scales_ptr += BLOCK_SIZE_K // quant_group_size
 
-                if use_init:
-                    init_states = tl.load(
-                        init_states_ptrs,
-                        mask=(offs_k_dstate[:, None] < dstate - k) &
-                        (offs_n[None, :] < hdim),
-                        other=0.0)
-                    init_states_ptrs += BLOCK_SIZE_K
-                    # Dequantization if state is fp8
-                    if tl.constexpr(init_states_ptrs.dtype.element_ty ==
-                                    tl.float8e4nv):
-                        if quant_group_size == -1:  # per-token or per-head
-                            fp8_scale = tl.load(scales_ptr)
-                            init_states = dequant_symmetric_per_tensor(
-                                init_states, fp8_scale)
-                        else:
-                            # BLOCK_SIZE_K can be a power of 2 value >= dstate
-                            tl.static_assert(BLOCK_SIZE_K %
-                                             quant_group_size == 0)
-                            tl.static_assert(dstate % quant_group_size == 0)
-                            offs_k_ngroups = tl.arange(
-                                0, (BLOCK_SIZE_K // quant_group_size))
-                            # fp8_scale: [, ngroups_per_row_block]
-                            fp8_scale = tl.load(
-                                scales_ptr +
-                                offs_n[:, None] * stride_scales_dim +
-                                offs_k_ngroups[None, :] * stride_scales_group,
-                                mask=((offs_n[:, None] < hdim)
-                                      & (offs_k_ngroups[None, :]
-                                         < (dstate // quant_group_size))),
-                                other=0.0)
-                            scales_ptr += BLOCK_SIZE_K // quant_group_size
-
-                            # NOTE: init_states is [K, N]
-                            init_states = dequant_symmetric_per_group(
-                                init_states.T,
-                                fp8_scale,
-                                quant_group_size,
-                            ).T
-                    prev_states = init_states.to(states_ptr.dtype.element_ty)
+                                # NOTE: init_states is [K, N]
+                                init_states = dequant_symmetric_per_group(
+                                    init_states.T,
+                                    fp8_scale,
+                                    quant_group_size,
+                                ).T
+                        prev_states = init_states.to(
+                            states_ptr.dtype.element_ty)
+                    else:  # verbosity due to the forbidden mixing static and dynamic flags
+                        prev_states = tl.load(
+                            prev_states_ptrs,
+                            mask=(offs_k_dstate[:, None] < dstate - k) &
+                            (offs_n[None, :] < hdim),
+                            other=0.0)
+                        prev_states_ptrs += BLOCK_SIZE_K
                 else:
                     prev_states = tl.load(
                         prev_states_ptrs,
