@@ -4,11 +4,13 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_chunk_scan.py
 
-# ruff: noqa: E501,SIM102
-
 from packaging import version
 
 from vllm.triton_utils import tl, triton
+
+# ruff: noqa: E501,SIM102
+from .quantization import (dequant_symmetric_per_group,
+                           dequant_symmetric_per_tensor, mamba_quant_helper)
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 
@@ -120,6 +122,7 @@ def _chunk_scan_fwd_kernel(
     states_ptr,
     D_ptr,
     initstates_ptr,
+    scales_ptr,
     chunk_indices_ptr,
     chunk_offsets_ptr,
     chunk_meta_num,
@@ -129,6 +132,7 @@ def _chunk_scan_fwd_kernel(
     dstate: tl.constexpr,
     seqlen,
     nheads_ngroups_ratio: tl.constexpr,
+    quant_group_size: tl.constexpr,
     # Strides
     stride_cb_chunk: tl.int64,
     stride_cb_head: tl.int64,
@@ -162,7 +166,12 @@ def _chunk_scan_fwd_kernel(
     stride_init_states_hdim: tl.int64,
     stride_init_states_dstate: tl.constexpr,
     stride_D_head: tl.constexpr,
+    stride_scales_batch: tl.int64,
+    stride_scales_head: tl.int64,
+    stride_scales_dim: tl.int64,
+    stride_scales_group: tl.int64,
     # Meta-parameters
+    IS_STATIC_SCALE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     HAS_D: tl.constexpr,
     D_HAS_HDIM: tl.constexpr,
@@ -197,17 +206,24 @@ def _chunk_scan_fwd_kernel(
     # M-block offsets and prev states
     #  - logic in next block may override these if there is an active offset
     offs_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
-    prev_states_ptr = states_ptr + c_idx * stride_states_chunk + pid_h * stride_states_head
-    prev_states_hdim = stride_states_hdim
-    prev_states_dstate = stride_states_dstate
-
     chunk_size_limit = min(chunk_size, seqlen - c_idx * chunk_size)
-
     seq_idx_ptr += c_idx * chunk_size * stride_seq_idx_seqlen
     # - we only need seq_idx_prev to be aligned to chunk boundary
     seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_seqlen,
                            mask=c_idx >= 1,
-                           other=0)
+                           other=-1)
+
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    dA_cs_m = tl.load(dA_cumsum_ptr + offs_m * stride_dA_cs_csize,
+                      mask=offs_m < chunk_size,
+                      other=0.0).to(tl.float32)
+
+    prev_states_ptr = states_ptr + c_idx * stride_states_chunk + pid_h * stride_states_head
+    prev_states_hdim = stride_states_hdim
+    prev_states_dstate = stride_states_dstate
+
+    # Determine if this tile should use initial states (scalar decision)
+    use_init = tl.zeros((), dtype=tl.int1)
 
     if HAS_INITSTATES:
         # if there are init states, we only need seq_idx_m to point
@@ -218,27 +234,11 @@ def _chunk_scan_fwd_kernel(
             seq_idx_m = tl.load(
                 seq_idx_ptr +
                 (pid_m * BLOCK_SIZE_M + c_off) * stride_seq_idx_seqlen, )
-
-            # - recall that in ssd_state_passing, for the case c_off == 0
-            # i.e., the very first sequence, we made states_ptr hold its initial state
-            # so this edge case is taken care of
-            if ((c_off == 0) and (seq_idx_prev != seq_idx_m
-                                  )  # if a seq is changed exactly on boundary
-                    or (c_off > 0)  # implies a new example (pseudo chunk)
-                ):
-
-                # - replace prev_states_ptr with init_states
-                prev_states_ptr = initstates_ptr + seq_idx_m * stride_init_states_batch + pid_h * stride_init_states_head
-                prev_states_hdim = stride_init_states_hdim  # override strides
-                prev_states_dstate = stride_init_states_dstate
-
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    dA_cs_m = tl.load(dA_cumsum_ptr + offs_m * stride_dA_cs_csize,
-                      mask=offs_m < chunk_size,
-                      other=0.0).to(tl.float32)
-
-    # - handle chunk state limit
-    if HAS_INITSTATES:
+            use_init = ((c_off > 0) | ((c_off == 0) &
+                                       (seq_idx_prev != seq_idx_m)))
+            # Base pointer for initial states (only valid when used)
+            initstates_ptr = initstates_ptr + seq_idx_m * stride_init_states_batch + pid_h * stride_init_states_head
+            scales_ptr = scales_ptr + seq_idx_m * stride_scales_batch + pid_h * stride_scales_head
         # have to split this if otherwise compilation will have problems
         dA_cs_m_boundary = 0.0
 
@@ -259,7 +259,6 @@ def _chunk_scan_fwd_kernel(
         # (logical) chunk indices.
 
         if (c_idx == c_idx_n) or c_off > 0:
-
             # get the next offset
             c_off_n = tl.load(chunk_offsets_ptr + (pid_c + 1),
                               mask=pid_c > -1 and (pid_c + 1) < chunk_meta_num,
@@ -276,7 +275,6 @@ def _chunk_scan_fwd_kernel(
                 mask=(((c_off - 1) > -1) and ((c_off) < chunk_size)),
                 other=0.0).to(tl.float32)
     else:
-        # - handle seq idx when HAS_INITSTATES==False
         seq_idx_m = tl.load(seq_idx_ptr + offs_m * stride_seq_idx_seqlen,
                             mask=offs_m < chunk_size_limit,
                             other=-1)
@@ -304,6 +302,10 @@ def _chunk_scan_fwd_kernel(
             # - if there is initstates, we will rely on prev_states, no zeroing
             #   required.
             scale_m = tl.exp(dA_cs_m - dA_cs_m_boundary)
+            # if use_init: # dynamic branch
+            init_states_ptrs = initstates_ptr + (
+                offs_n[None, :] * stride_init_states_hdim +
+                offs_k_dstate[:, None] * stride_init_states_dstate)
 
         if BLOCK_SIZE_DSTATE <= 128:
             C = tl.load(C_ptrs,
@@ -311,10 +313,47 @@ def _chunk_scan_fwd_kernel(
                         (offs_k_dstate[None, :] < dstate),
                         other=0.0)
 
-            prev_states = tl.load(prev_states_ptrs,
-                                  mask=(offs_k_dstate[:, None] < dstate) &
-                                  (offs_n[None, :] < hdim),
-                                  other=0.0)
+            # Dynamic branch for loading init_state which may be a different dtype
+            # from prev_states. use_init==True implies HAS_INITSTATES
+            if use_init:
+                init_states = tl.load(init_states_ptrs,
+                                      mask=(offs_k_dstate[:, None] < dstate) &
+                                      (offs_n[None, :] < hdim),
+                                      other=0.0)
+                # Dequantization if state is fp8
+                if tl.constexpr(
+                        init_states_ptrs.dtype.element_ty == tl.float8e4nv):
+                    if quant_group_size == -1:  # per-token or per-head
+                        fp8_scale = tl.load(scales_ptr)
+                        init_states = dequant_symmetric_per_tensor(
+                            init_states, fp8_scale)
+                    else:
+                        # BLOCK_SIZE_DSTATE can be a power of 2 value >= dstate
+                        tl.static_assert(BLOCK_SIZE_DSTATE %
+                                         quant_group_size == 0)
+                        tl.static_assert(dstate % quant_group_size == 0)
+                        offs_k_ngroups = tl.arange(
+                            0, (BLOCK_SIZE_DSTATE // quant_group_size))
+                        # fp8_scale: [, ngroups_per_row]
+                        fp8_scale = tl.load(
+                            scales_ptr + offs_n[:, None] * stride_scales_dim +
+                            offs_k_ngroups[None, :] * stride_scales_group,
+                            mask=((offs_n[:, None] < hdim)
+                                  & (offs_k_ngroups[None, :]
+                                     < (dstate // quant_group_size))),
+                            other=0.0)
+                        # NOTE: init_states is [K, N]
+                        init_states = dequant_symmetric_per_group(
+                            init_states.T,
+                            fp8_scale,
+                            quant_group_size,
+                        ).T
+                prev_states = init_states.to(states_ptr.dtype.element_ty)
+            else:
+                prev_states = tl.load(prev_states_ptrs,
+                                      mask=(offs_k_dstate[:, None] < dstate) &
+                                      (offs_n[None, :] < hdim),
+                                      other=0.0)
             prev_states = prev_states.to(C_ptr.dtype.element_ty)
             acc = tl.dot(C, prev_states) * scale_m[:, None]
         else:
@@ -323,16 +362,58 @@ def _chunk_scan_fwd_kernel(
                             mask=(offs_m[:, None] < chunk_size_limit) &
                             (offs_k_dstate[None, :] < dstate - k),
                             other=0.0)
-                # C = (C * scale_m[:, None]).to(C_ptr.dtype.element_ty)
-                prev_states = tl.load(
-                    prev_states_ptrs,
-                    mask=(offs_k_dstate[:, None] < dstate - k) &
-                    (offs_n[None, :] < hdim),
-                    other=0.0)
+
+                if use_init:
+                    init_states = tl.load(
+                        init_states_ptrs,
+                        mask=(offs_k_dstate[:, None] < dstate - k) &
+                        (offs_n[None, :] < hdim),
+                        other=0.0)
+                    init_states_ptrs += BLOCK_SIZE_K
+                    # Dequantization if state is fp8
+                    if tl.constexpr(init_states_ptrs.dtype.element_ty ==
+                                    tl.float8e4nv):
+                        if quant_group_size == -1:  # per-token or per-head
+                            fp8_scale = tl.load(scales_ptr)
+                            init_states = dequant_symmetric_per_tensor(
+                                init_states, fp8_scale)
+                        else:
+                            # BLOCK_SIZE_K can be a power of 2 value >= dstate
+                            tl.static_assert(BLOCK_SIZE_K %
+                                             quant_group_size == 0)
+                            tl.static_assert(dstate % quant_group_size == 0)
+                            offs_k_ngroups = tl.arange(
+                                0, (BLOCK_SIZE_K // quant_group_size))
+                            # fp8_scale: [, ngroups_per_row_block]
+                            fp8_scale = tl.load(
+                                scales_ptr +
+                                offs_n[:, None] * stride_scales_dim +
+                                offs_k_ngroups[None, :] * stride_scales_group,
+                                mask=((offs_n[:, None] < hdim)
+                                      & (offs_k_ngroups[None, :]
+                                         < (dstate // quant_group_size))),
+                                other=0.0)
+                            scales_ptr += BLOCK_SIZE_K // quant_group_size
+
+                            # NOTE: init_states is [K, N]
+                            init_states = dequant_symmetric_per_group(
+                                init_states.T,
+                                fp8_scale,
+                                quant_group_size,
+                            ).T
+                    prev_states = init_states.to(states_ptr.dtype.element_ty)
+                else:
+                    prev_states = tl.load(
+                        prev_states_ptrs,
+                        mask=(offs_k_dstate[:, None] < dstate - k) &
+                        (offs_n[None, :] < hdim),
+                        other=0.0)
+                    prev_states_ptrs += BLOCK_SIZE_K
+
                 prev_states = prev_states.to(C_ptr.dtype.element_ty)
                 acc += tl.dot(C, prev_states)
                 C_ptrs += BLOCK_SIZE_K
-                prev_states_ptrs += BLOCK_SIZE_K
+
             acc *= scale_m[:, None]
 
     offs_k = tl.arange(0, BLOCK_SIZE_K) + c_off
@@ -409,19 +490,21 @@ def _chunk_scan_fwd_kernel(
 
 
 def _chunk_scan_fwd(
-    cb,
-    x,
-    dt,
-    dA_cumsum,
-    C,
-    states,
-    out,
-    seq_idx,
-    D=None,
-    z=None,
-    chunk_indices=None,
-    chunk_offsets=None,
-    initial_states=None,
+        cb,
+        x,
+        dt,
+        dA_cumsum,
+        C,
+        states,
+        out,
+        seq_idx,
+        D=None,
+        z=None,
+        chunk_indices=None,
+        chunk_offsets=None,
+        initial_states=None,
+        is_fp8_static_scale: bool = None,  # fp8 initial_states
+        fp8_scales=None,  # fp8 initial_states
 ):
     assert seq_idx is not None, "this implementation requires seq_idx"
 
@@ -441,6 +524,7 @@ def _chunk_scan_fwd(
     assert seq_idx.shape == (seqlen, )
 
     if initial_states is not None:
+        # assert initial_states.shape == (batch, nheads, headdim, dstate)
         # with initial states, we need to take care of how
         # seq_idx crosses the boundaries
         assert chunk_indices is not None and chunk_offsets is not None, \
@@ -460,6 +544,13 @@ def _chunk_scan_fwd(
                                initial_states.stride(2),
                                initial_states.stride(3))
                               if initial_states is not None else (0, 0, 0, 0))
+
+    # quant_helper computes FP8 quantization metadata and perform checks
+    scales_strides, quant_group_size = mamba_quant_helper(
+        (fp8_scales.shape[0] if fp8_scales is not None else 0, nheads, headdim,
+         dstate),
+        fp8_scales,
+        NO_HEADS=False)
 
     _chunk_scan_fwd_kernel[grid](
         cb_ptr=cb,
@@ -481,6 +572,8 @@ def _chunk_scan_fwd(
         dstate=dstate,
         seqlen=seqlen,
         nheads_ngroups_ratio=nheads // ngroups,
+        scales_ptr=fp8_scales,  # in-place update if dynamic quant
+        quant_group_size=quant_group_size,
         stride_cb_chunk=cb.stride(0),
         stride_cb_head=cb.stride(1),
         stride_cb_csize_m=cb.stride(2),
@@ -513,6 +606,11 @@ def _chunk_scan_fwd(
         stride_init_states_hdim=initial_states_strides[2],
         stride_init_states_dstate=initial_states_strides[3],
         stride_D_head=D.stride(0) if D is not None else 0,
+        stride_scales_batch=scales_strides[0],
+        stride_scales_head=scales_strides[1],
+        stride_scales_dim=scales_strides[2],
+        stride_scales_group=scales_strides[3],
+        IS_STATIC_SCALE=is_fp8_static_scale,
         IS_CAUSAL=True,
         HAS_D=D is not None,
         D_HAS_HDIM=D.dim() == 2 if D is not None else True,
