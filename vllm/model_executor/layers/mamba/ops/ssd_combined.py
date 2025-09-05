@@ -10,6 +10,7 @@ import torch
 from einops import rearrange
 from packaging import version
 
+from vllm._custom_ops import scaled_fp8_quant
 from vllm.triton_utils import triton
 
 from .ssd_bmm import _bmm_chunk_fwd
@@ -111,14 +112,34 @@ def _mamba_chunk_scan_combined_fwd(x,
     # - this will ensure that states will be updated with the rightmost flushed seq_idx
     #   of the previous chunk. This implies that the first chunk of states is either 0
     #   or equal to init_states of the first example.
+
+    # DEBUG: DO NOT COMMIT THIS CHANGE
+    is_fp8_static_scale = True
+    fp8_scales = None
+    if initial_states is not None:
+        assert is_fp8_static_scale
+        batch = initial_states.shape[0]
+        # quant
+        initial_states, fp8_scales = scaled_fp8_quant(
+            initial_states.view(batch, -1), use_per_token_if_dynamic=True)
+        initial_states = initial_states.view(batch, nheads, headdim, dstate)
+        fp8_scales = fp8_scales.squeeze(1)
+
+    # NOTE: _state_passing_fwd loads data from mamba SSM state cache. The cached state
+    #       might be quantized, and would require corresponding scales.
+    #       The output is intermediate and not the final result of mamba state.
+    #       Its precision is determined by out_dtype. We don't quantize it, to keep
+    #       the error small for computations.
     states = _state_passing_fwd(
         rearrange(states,
                   "... p n -> ... (p n)"),  # (nchunks, nheads, headdim*dstate)
         dA_cumsum[:, :, -1],  # (nheads, nchunks)
         dstate=dstate,
-        initial_states=rearrange(initial_states, "... p n -> ... (p n)")
-        if initial_states is not None else
-        None,  # (batch, nheads, headdim*dstate)
+        initial_states=initial_states.view(-1, nheads, headdim *
+                                           dstate) if initial_states
+        is not None else None,  # (batch, nheads, headdim*dstate)
+        is_fp8_static_scale=is_fp8_static_scale,
+        fp8_scales=fp8_scales,
         seq_idx=seq_idx,
         chunk_size=chunk_size,
         out_dtype=state_dtype if state_dtype is not None else C.dtype)
@@ -141,6 +162,8 @@ def _mamba_chunk_scan_combined_fwd(x,
     # - in each (pseudo) chunk, we detect if the previous (pseudo) chunk had
     #   a seq_idx change, in which case we take states information from
     #   init_states.
+    # - When quantized mamba ssm state is used, it is possible that
+    #   initial_states has a different dtype from states.
     _chunk_scan_fwd(
         CB,
         x,
@@ -155,6 +178,8 @@ def _mamba_chunk_scan_combined_fwd(x,
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
         initial_states=initial_states,
+        is_fp8_static_scale=is_fp8_static_scale,
+        fp8_scales=fp8_scales,
     )
 
     varlen_states = chunk_state_varlen(
@@ -165,6 +190,8 @@ def _mamba_chunk_scan_combined_fwd(x,
         cu_seqlens,
         states,
         initial_states=initial_states,
+        is_fp8_static_scale=is_fp8_static_scale,
+        fp8_scales=fp8_scales,
     )
 
     return varlen_states

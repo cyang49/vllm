@@ -13,6 +13,8 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .mamba_ssm import softplus
+from .quantization import (dequant_symmetric_per_group,
+                           dequant_symmetric_per_tensor, mamba_quant_helper)
 
 
 @triton.autotune(
@@ -380,41 +382,48 @@ def _chunk_state_varlen_kernel(
     cu_seqlens_ptr,
     states_ptr,
     initstates_ptr,
+    scales_ptr,
     # Matrix dimensions
     hdim: tl.constexpr,
     dstate: tl.constexpr,
     chunk_size: tl.constexpr,
     nheads_ngroups_ratio: tl.constexpr,
+    quant_group_size: tl.constexpr,
     # Strides
-    stride_x_seqlen: tl.constexpr,
-    stride_x_head: tl.constexpr,
-    stride_x_hdim: tl.constexpr,
-    stride_b_seqlen: tl.constexpr,
-    stride_b_head: tl.constexpr,
-    stride_b_dstate: tl.constexpr,
-    stride_dt_chunk: tl.constexpr,
-    stride_dt_head,
-    stride_dt_csize: tl.constexpr,
-    stride_dA_cs_chunk: tl.constexpr,
-    stride_dA_cs_head,
-    stride_dA_cs_csize: tl.constexpr,
-    stride_chunk_states_chunk: tl.constexpr,
-    stride_chunk_states_head: tl.constexpr,
-    stride_chunk_states_hdim: tl.constexpr,
-    stride_chunk_states_dstate: tl.constexpr,
-    stride_states_batch: tl.constexpr,
-    stride_states_head: tl.constexpr,
-    stride_states_hdim: tl.constexpr,
-    stride_states_dstate: tl.constexpr,
-    stride_init_states_batch: tl.constexpr,
-    stride_init_states_head: tl.constexpr,
-    stride_init_states_hdim: tl.constexpr,
-    stride_init_states_dstate: tl.constexpr,
+    stride_x_seqlen: tl.int64,
+    stride_x_head: tl.int64,
+    stride_x_hdim: tl.int64,
+    stride_b_seqlen: tl.int64,
+    stride_b_head: tl.int64,
+    stride_b_dstate: tl.int64,
+    stride_dt_chunk: tl.int64,
+    stride_dt_head: tl.int64,
+    stride_dt_csize: tl.int64,
+    stride_dA_cs_chunk: tl.int64,
+    stride_dA_cs_head: tl.int64,
+    stride_dA_cs_csize: tl.int64,
+    stride_chunk_states_chunk: tl.int64,
+    stride_chunk_states_head: tl.int64,
+    stride_chunk_states_hdim: tl.int64,
+    stride_chunk_states_dstate: tl.int64,
+    stride_states_batch: tl.int64,
+    stride_states_head: tl.int64,
+    stride_states_hdim: tl.int64,
+    stride_states_dstate: tl.int64,
+    stride_init_states_batch: tl.int64,
+    stride_init_states_head: tl.int64,
+    stride_init_states_hdim: tl.int64,
+    stride_init_states_dstate: tl.int64,
+    stride_scales_batch: tl.int64,
+    stride_scales_head: tl.int64,
+    stride_scales_dim: tl.int64,
+    stride_scales_group: tl.int64,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
+    IS_STATIC_SCALE: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
@@ -484,6 +493,7 @@ def _chunk_state_varlen_kernel(
     # If HAS_INITSTATES==True need to consider two possiblties
     # - if start_idx < pid_c * chunk_size, then we need to take the past_states_ptrs
     # - if state_idx >= pid * chunk_size, then we need to insert initstates
+    use_init = start_idx >= pid_c * chunk_size
     if ((start_idx < pid_c * chunk_size)  # first chunk
             or (HAS_INITSTATES)):
 
@@ -493,35 +503,90 @@ def _chunk_state_varlen_kernel(
             past_states_ptrs = chunk_states_ptr + (
                 offs_m[:, None] * stride_chunk_states_hdim +
                 offs_n[None, :] * stride_chunk_states_dstate)
+            past_states = tl.load(past_states_ptrs,
+                                  mask=(offs_m[:, None] < hdim) &
+                                  (offs_n[None, :] < dstate),
+                                  other=0.0)
         else:
-
-            # - this seems repetitive, buts its to help the compiler
-            if start_idx < pid_c * chunk_size:
-                past_states_ptrs = chunk_states_ptr + (
-                    offs_m[:, None] * stride_chunk_states_hdim +
-                    offs_n[None, :] * stride_chunk_states_dstate)
-            else:
-                past_states_ptrs = initstates_ptr + (
+            if use_init:
+                init_states_ptrs = initstates_ptr + (
                     pid_b * stride_init_states_batch +
                     offs_m[:, None] * stride_init_states_hdim +
                     offs_n[None, :] * stride_init_states_dstate)
-
+                init_states = tl.load(init_states_ptrs,
+                                      mask=(offs_m[:, None] < hdim) &
+                                      (offs_n[None, :] < dstate),
+                                      other=0.0)
+                # Dequantization if state is fp8
+                if tl.constexpr(
+                        initstates_ptr.dtype.element_ty == tl.float8e4nv):
+                    if quant_group_size == -1:  # per-token or per-head
+                        fp8_scale = tl.load(scales_ptr +
+                                            pid_b * stride_scales_batch +
+                                            pid_h * stride_scales_head)
+                        init_states = dequant_symmetric_per_tensor(
+                            init_states, fp8_scale)
+                    else:
+                        # BLOCK_SIZE_N can be a power of 2 value >= dstate
+                        tl.static_assert(BLOCK_SIZE_N % quant_group_size == 0)
+                        offs_ngroups = tl.arange(
+                            0, (BLOCK_SIZE_N // quant_group_size))
+                        # fp8_scale: [BLOCK_SIZE_M, ngroups_per_row]
+                        fp8_scale = tl.load(
+                            scales_ptr + pid_b * stride_scales_batch +
+                            pid_h * stride_scales_head +
+                            offs_m[:, None] * stride_scales_dim +
+                            offs_ngroups[None, :] * stride_scales_group,
+                            mask=((offs_m[:, None] < hdim)
+                                  & (offs_ngroups[None, :]
+                                     < (dstate // quant_group_size))),
+                            other=0.0)
+                        init_states = dequant_symmetric_per_group(
+                            init_states, fp8_scale, quant_group_size)
+                past_states = init_states.to(chunk_states_ptr.dtype.element_ty)
                 # need to adjust the boundary
                 if start_idx > pid_c * chunk_size:
                     dA_cs_boundary = tl.load(dA_cumsum_ptr +
                                              (start_idx - pid_c * chunk_size -
                                               1) * stride_dA_cs_csize).to(
                                                   tl.float32)
+            else:
+                past_states_ptrs = chunk_states_ptr + (
+                    offs_m[:, None] * stride_chunk_states_hdim +
+                    offs_n[None, :] * stride_chunk_states_dstate)
+                past_states = tl.load(past_states_ptrs,
+                                      mask=(offs_m[:, None] < hdim) &
+                                      (offs_n[None, :] < dstate),
+                                      other=0.0)
 
-        past_states = tl.load(past_states_ptrs,
-                              mask=(offs_m[:, None] < hdim) &
-                              (offs_n[None, :] < dstate),
-                              other=0.0).to(tl.float32)
+        past_states = past_states.to(tl.float32)
 
         scale = tl.exp(dA_cs_last - dA_cs_boundary)
         acc += past_states * scale
 
-    states = acc.to(states_ptr.dtype.element_ty)
+    states = acc
+    # # Quantization before store back (bugged, disable for now)
+    # if (HAS_INITSTATES and tl.constexpr(initstates_ptr.dtype.element_ty == tl.float8e4nv)):
+    #     if IS_STATIC_SCALE:
+    #         if quant_group_size == -1:
+    #             states, _ = quant_symmetric_per_tensor_fp8e4nv(states, fp8_scale)
+    #         else:
+    #             states, _ = quant_symmetric_per_group_fp8e4nv(
+    #                 states, quant_group_size, fp8_scale)
+    #     else:  # dynamic
+    #         tl.static_assert(quant_group_size != -1)
+    #         states, fp8_scale = quant_symmetric_per_group_fp8e4nv(
+    #             states, quant_group_size)
+    #         tl.store(
+    #             scales_ptr + pid_b * stride_scales_batch +
+    #             pid_h * stride_scales_head +
+    #             offs_m[:, None] * stride_scales_dim +
+    #             offs_ngroups[None, :] * stride_scales_group,
+    #             fp8_scale,
+    #             mask=((offs_m[:, None] < hdim)
+    #                   &
+    #                   (offs_ngroups[None, :] < (dstate // quant_group_size))),
+    #         )
 
     states_ptr += pid_b * stride_states_batch + pid_h * stride_states_head
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -529,7 +594,7 @@ def _chunk_state_varlen_kernel(
     states_ptrs = states_ptr + (offs_m[:, None] * stride_states_hdim +
                                 offs_n[None, :] * stride_states_dstate)
     c_mask = (offs_m[:, None] < hdim) & (offs_n[None, :] < dstate)
-    tl.store(states_ptrs, states, mask=c_mask)
+    tl.store(states_ptrs, states.to(states_ptr.dtype.element_ty), mask=c_mask)
 
 
 def _chunk_cumsum_fwd(dt,
@@ -647,13 +712,17 @@ def _chunk_state_fwd(B,
     return states
 
 
-def chunk_state_varlen(B,
-                       x,
-                       dt,
-                       dA_cumsum,
-                       cu_seqlens,
-                       chunk_states,
-                       initial_states=None):
+def chunk_state_varlen(
+        B,
+        x,
+        dt,
+        dA_cumsum,
+        cu_seqlens,
+        chunk_states,
+        initial_states=None,
+        is_fp8_static_scale: bool = None,  # fp8 initial_states
+        fp8_scales=None,  # fp8 initial_states
+):
     total_seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
     _, ngroups, dstate = B.shape
@@ -668,11 +737,15 @@ def chunk_state_varlen(B,
     if initial_states is not None:
         assert initial_states.shape == (batch, nheads, headdim, dstate)
 
+    # Placeholder for the final mamba ssm state
+    # The state will be copied to mamba ssm state cache
+    state_out_dtype = (torch.float8_e4m3fn
+                       if fp8_scales is not None else chunk_states.dtype)
     states = torch.empty(batch,
                          nheads,
                          headdim,
                          dstate,
-                         dtype=chunk_states.dtype,
+                         dtype=state_out_dtype,
                          device=chunk_states.device)
 
     initial_states_strides = ((initial_states.stride(0),
@@ -680,6 +753,11 @@ def chunk_state_varlen(B,
                                initial_states.stride(2),
                                initial_states.stride(3))
                               if initial_states is not None else (0, 0, 0, 0))
+
+    # quant_helper computes FP8 quantization metadata and perform checks
+    scales_strides, quant_group_size = mamba_quant_helper(states.shape,
+                                                          fp8_scales,
+                                                          NO_HEADS=False)
 
     grid = lambda META: (triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.
                          cdiv(dstate, META['BLOCK_SIZE_N']), batch, nheads)
@@ -697,6 +775,8 @@ def chunk_state_varlen(B,
             dstate=dstate,
             chunk_size=chunk_size,
             nheads_ngroups_ratio=nheads // ngroups,
+            scales_ptr=fp8_scales,  # in-place update if dynamic quant
+            quant_group_size=quant_group_size,
             stride_x_seqlen=x.stride(0),
             stride_x_head=x.stride(1),
             stride_x_hdim=x.stride(2),
@@ -721,5 +801,10 @@ def chunk_state_varlen(B,
             stride_init_states_head=initial_states_strides[1],
             stride_init_states_hdim=initial_states_strides[2],
             stride_init_states_dstate=initial_states_strides[3],
+            stride_scales_batch=scales_strides[0],
+            stride_scales_head=scales_strides[1],
+            stride_scales_dim=scales_strides[2],
+            stride_scales_group=scales_strides[3],
+            IS_STATIC_SCALE=is_fp8_static_scale,
             HAS_INITSTATES=initial_states is not None)
     return states
