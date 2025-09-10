@@ -432,8 +432,8 @@ def _fused5_ssd_kernel(
                                (chunk_size_limit - 1) * stride_seq_idx_seqlen)
 
         # chunk state chunk_size loop
-        acc = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS),
-                       dtype=states_G_ptr.dtype.element_ty)
+        acc_dtype = tl.float32 if states_G_ptr.dtype.element_ty == tl.bfloat16 else states_G_ptr.dtype.element_ty
+        acc = tl.zeros((BLOCK_SIZE_HD, BLOCK_SIZE_DS), dtype=acc_dtype)
         for k in range(0, chunk_size_limit, BLOCK_SIZE_CS):
             if (not NEED_MASK_HD) and (not NEED_MASK_1_DS):
                 x = tl.load(x_ptrs_cs,
@@ -647,9 +647,10 @@ def _fused5_ssd_kernel(
                                     mask=offs_cs < chunk_size_limit,
                                     other=-1)
 
+            acc_dtype = tl.float32 if out_ptr.dtype.element_ty == tl.bfloat16 else out_ptr.dtype.element_ty
+            acc_dtype = acc_dtype if not CS_ACC_FP32 else tl.float32
             acc = tl.zeros((CS_BLOCK_SIZE_CS_outer, BLOCK_SIZE_HD),
-                           dtype=out_ptr.dtype.element_ty
-                           if not CS_ACC_FP32 else tl.float32)
+                           dtype=acc_dtype)
 
             # Without the if (pid_c > -1), with Triton 2.1.0, I get
             # Assertion `!(srcMmaLayout && dstMmaLayout) && "Unexpected mma -> mm a layout conversion"' failed.
