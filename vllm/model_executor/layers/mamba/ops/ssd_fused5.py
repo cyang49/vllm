@@ -500,7 +500,8 @@ def _fused5_ssd_kernel(
         seq_idx_new = tl.load(seq_idx_ptr +
                               (min((pid_c + 1) * chunk_size, seqlen) - 1) *
                               stride_seq_idx_seqlen)
-        scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+        if not HAS_INITSTATES:  # don't let previous chunk affect if new sequence
+            scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
 
         # sync
         # the atomic represents which pid_c is ready
