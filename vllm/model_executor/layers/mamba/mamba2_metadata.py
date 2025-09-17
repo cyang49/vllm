@@ -104,11 +104,11 @@ def prepare_mamba2_metadata(
                 query_start_loc_p, chunk_size, num_prefill_tokens)
 
     metadata = Mamba2Metadata(has_initial_states_p=has_initial_states_p,
-                          prep_initial_states=prep_initial_states,
-                          chunk_size=chunk_size,
-                          query_start_loc_p=query_start_loc_p,
-                          seq_idx_p=seq_idx_p,
-                          chunk_indices_p=chunk_indices_p,
-                          chunk_offsets_p=chunk_offsets_p)
+                              prep_initial_states=prep_initial_states,
+                              chunk_size=chunk_size,
+                              query_start_loc_p=query_start_loc_p,
+                              seq_idx_p=seq_idx_p,
+                              chunk_indices_p=chunk_indices_p,
+                              chunk_offsets_p=chunk_offsets_p)
 
     return update_metadata(metadata) if num_prefills > 0 else metadata

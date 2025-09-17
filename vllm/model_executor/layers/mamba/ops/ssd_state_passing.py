@@ -58,9 +58,9 @@ def _state_passing_fwd_kernel(
     pid_h = tl.program_id(axis=1)
     pid_m = tl.program_id(axis=0)
     states_ptr += pid_h * stride_states_head
-    dA_cs_ptr += pid_h * stride_dA_cs_head + (
-        chunk_size - 1) * stride_dA_cs_csize
-    out_ptr += pid_h * stride_out_head 
+    dA_cs_ptr += pid_h * stride_dA_cs_head + (chunk_size -
+                                              1) * stride_dA_cs_csize
+    out_ptr += pid_h * stride_out_head
     if HAS_INITSTATES:
         initstates_ptr += pid_h * stride_initstates_head
 
@@ -91,8 +91,9 @@ def _state_passing_fwd_kernel(
         # - the seq to pass forward is the one that is flushed to the right
         #   boundary.
         # - that is given by seq_idx_chunk_end below: the sequence index at the end of the chunk.
-        seq_idx_chunk_end = tl.load(seq_idx_ptr + (min(
-            (c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+        seq_idx_chunk_end = tl.load(seq_idx_ptr +
+                                    (min((c + 1) * chunk_size, seqlen) - 1) *
+                                    stride_seq_idx_seqlen)
 
         if HAS_INITSTATES:
             if prev_seq_idx_chunk_end != seq_idx_chunk_end:
@@ -103,9 +104,8 @@ def _state_passing_fwd_kernel(
                 initstates_ptrs = initstates_ptr + seq_idx_chunk_end * stride_initstates_batch
 
                 # - update state with seq_idx_new's init state
-                states = tl.load(initstates_ptrs,
-                                    mask=offs_m < dim,
-                                    other=0.0).to(tl.float32)
+                states = tl.load(initstates_ptrs, mask=offs_m < dim,
+                                 other=0.0).to(tl.float32)
 
                 # - we need to consider the cumsum only of the last sequence in the chunk
                 # - find its starting position (given by c_off of the logical chunk index)
@@ -113,8 +113,8 @@ def _state_passing_fwd_kernel(
                 # - first, update the logical chunk index (add the number of sequences in the current physical chunk):
                 # sequence index at the start of the current chunk
                 seq_idx_chunk_start = tl.load(seq_idx_ptr +
-                                                min(c * chunk_size, seqlen) *
-                                                stride_seq_idx_seqlen)
+                                              min(c * chunk_size, seqlen) *
+                                              stride_seq_idx_seqlen)
                 logical_chunk_idx += seq_idx_chunk_end - seq_idx_chunk_start
                 # - load the chunk offset:
                 c_off = tl.load(chunk_offsets_ptr + logical_chunk_idx,
@@ -176,7 +176,8 @@ def _state_passing_fwd(
             initstates_ptr=initial_states,
             seq_idx_ptr=seq_idx,
             chunk_offsets_ptr=chunk_offsets,
-            chunk_meta_num=len(chunk_offsets) if chunk_offsets is not None else 0,
+            chunk_meta_num=len(chunk_offsets)
+            if chunk_offsets is not None else 0,
             dim=dim,
             nchunks=nchunks,
             seqlen=seqlen if seq_idx is not None else 0,
