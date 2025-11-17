@@ -51,7 +51,7 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 
-from .ssm_state_dicts import ssm_state_scale_dict_p99 as ssm_state_scale_dict
+from .ssm_state_dicts import ssm_state_scale_dict_offline as ssm_state_scale_dict
 
 # Added by the IBM Team, 2024
 
@@ -937,100 +937,84 @@ class MambaMixer2(MambaBase, CustomOp):
                 -1, self.num_heads // self.tp_size, self.head_dim
             )
 
-            # if ssm_state.dtype == self.fp8_dtype:
-            #     # Load from cache and dequant
-            #     ssm_states_d = ssm_state[state_indices_tensor_d_input]
-            #     # per-tensor dequantization
-            #     # ssm_states_d = (
-            #     #     ssm_states_d.to(torch.float32) * self.ssm_state_scale
-            #     # ).to(torch.bfloat16)
-            #     # per-head dequantization
-            #     # ssm_states_d = (
-            #     #     ssm_states_d.to(torch.float32)
-            #     #     * self.ssm_state_scale[None, :, None, None]
-            #     # ).to(torch.bfloat16)
-            #     ssm_states_d = (
-            #         ssm_states_d.to(torch.float32)
-            #         * self.ssm_state_scale.reshape(
-            #             1, self.num_heads, self.head_dim, 1)
-            #     ).to(torch.bfloat16)
+            FP8_NON_FUSED_DECODE = False
+            if FP8_NON_FUSED_DECODE:
+                # Load from cache and dequant
+                ssm_states_d = ssm_state[state_indices_tensor_d_input]
+                # per-tensor dequantization
+                # ssm_states_d = (
+                #     ssm_states_d.to(torch.float32) * self.ssm_state_scale
+                # ).to(torch.bfloat16)
+                # per-head dequantization
+                # ssm_states_d = (
+                #     ssm_states_d.to(torch.float32)
+                #     * self.ssm_state_scale[None, :, None, None]
+                # ).to(torch.bfloat16)
+                ssm_states_d = (
+                    ssm_states_d.to(torch.float32) * self.ssm_state_scale
+                    # * self.ssm_state_scale.reshape(
+                    #     1, self.num_heads, self.head_dim, 1)
+                ).to(torch.bfloat16)
 
-            #     selective_state_update(
-            #         ssm_states_d,
-            #         hidden_states_d,
-            #         dt_d,
-            #         A_d,
-            #         B_d,
-            #         C_d,
-            #         D_d,
-            #         z=None,
-            #         dt_bias=dt_bias,
-            #         dt_softplus=True,
-            #         out=preallocated_ssm_out_d.view(
-            #            num_decodes, -1, self.head_dim),
-            #     )
+                selective_state_update(
+                    ssm_states_d,
+                    hidden_states_d,
+                    dt_d,
+                    A_d,
+                    B_d,
+                    C_d,
+                    D_d,
+                    z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=True,
+                    out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
+                )
 
-            #     # Quantization before storing back
-            #     # original_shape = ssm_states_d.shape
-            #     # DON'T UPDATE SCALE in decode
-            #     # per-tensor quantization
-            #     # ssm_states_d, _ = scaled_fp8_quant(
-            #     #     ssm_states_d.view(num_decodes, -1), self.ssm_state_scale
-            #     # )
-            #     # ssm_state[state_indices_tensor_d_output] = \
-            #     #     ssm_states_d.reshape(
-            #     #         original_shape
-            #     #     )
-            #     # ssm_states_d = (ssm_states_d
-            #     #     / self.ssm_state_scale[None, :, None, None])
-            #     ssm_states_d = ssm_states_d / self.ssm_state_scale.reshape(
-            #         1, self.num_heads, self.head_dim, 1
-            #     )
-            #     ssm_states_d = ssm_states_d.clamp(-448.0, 448.0).to(self.fp8_dtype)
-            #     ssm_state[state_indices_tensor_d_output] = ssm_states_d
-            #     selective_state_update(
-            #         ssm_state,
-            #         hidden_states_d,
-            #         dt_d,
-            #         A_d,
-            #         B_d,
-            #         C_d,
-            #         D_d,
-            #         z=None,
-            #         dt_bias=dt_bias,
-            #         dt_softplus=True,
-            #         state_batch_indices=state_indices_tensor_d_input,
-            #         dst_state_batch_indices=state_indices_tensor_d_output,
-            #         out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
-
-            #     )
-            # else:
-
-            # - the hidden is reshaped into (bs, num_heads, head_dim)
-            # - mamba_cache_params.ssm_state's slots will be selected
-            #   using state_indices_tensor_d
-            # NOTE: final output is an in-place update of out tensor
-            selective_state_update(
-                ssm_state,
-                hidden_states_d,
-                dt_d,
-                A_d,
-                B_d,
-                C_d,
-                D_d,
-                z=None,
-                dt_bias=dt_bias,
-                dt_softplus=True,
-                state_batch_indices=state_indices_tensor_d_input,
-                dst_state_batch_indices=state_indices_tensor_d_output,
-                out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
-                is_fp8_static_scale=True,
-                fp8_scales=(
-                    None
-                    if ssm_state.dtype != self.fp8_dtype
-                    else self.ssm_state_scale.expand(num_decodes)
-                ),  # add batch dim
-            )
+                # Quantization before storing back
+                # original_shape = ssm_states_d.shape
+                # DON'T UPDATE SCALE in decode
+                # per-tensor quantization
+                # ssm_states_d, _ = scaled_fp8_quant(
+                #     ssm_states_d.view(num_decodes, -1), self.ssm_state_scale
+                # )
+                # ssm_state[state_indices_tensor_d_output] = \
+                #     ssm_states_d.reshape(
+                #         original_shape
+                #     )
+                # ssm_states_d = (ssm_states_d
+                #     / self.ssm_state_scale[None, :, None, None])
+                ssm_states_d = ssm_states_d / self.ssm_state_scale
+                # ssm_states_d = ssm_states_d / self.ssm_state_scale.reshape(
+                #     1, self.num_heads, self.head_dim, 1
+                # )
+                ssm_states_d = ssm_states_d.clamp(-448.0, 448.0).to(self.fp8_dtype)
+                ssm_state[state_indices_tensor_d_output] = ssm_states_d
+            else:
+                # - the hidden is reshaped into (bs, num_heads, head_dim)
+                # - mamba_cache_params.ssm_state's slots will be selected
+                #   using state_indices_tensor_d
+                # NOTE: final output is an in-place update of out tensor
+                selective_state_update(
+                    ssm_state,
+                    hidden_states_d,
+                    dt_d,
+                    A_d,
+                    B_d,
+                    C_d,
+                    D_d,
+                    z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=state_indices_tensor_d_input,
+                    dst_state_batch_indices=state_indices_tensor_d_output,
+                    out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
+                    is_fp8_static_scale=True,
+                    fp8_scales=(
+                        None
+                        if ssm_state.dtype != self.fp8_dtype
+                        else self.ssm_state_scale.expand(num_decodes)
+                    ),  # add batch dim
+                )
             # _, fp8_scale = scaled_fp8_quant(
             #    ssm_state[state_indices_tensor_d_output].view(num_decodes, -1))
             # print(f"decode {self.prefix} {fp8_scale=}")
