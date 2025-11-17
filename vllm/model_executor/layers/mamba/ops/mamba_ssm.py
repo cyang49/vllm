@@ -11,6 +11,13 @@ from vllm import _custom_ops as ops
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+from .quantization import (
+    dequant_symmetric_per_group,
+    dequant_symmetric_per_tensor,
+    quant_symmetric_per_group_fp8e4nv,
+    quant_symmetric_per_tensor_fp8e4nv,
+)
+
 TRITON3 = HAS_TRITON and (version.parse(triton.__version__) >= version.parse("3.0.0"))
 
 if TRITON3:
@@ -54,44 +61,50 @@ def _selective_scan_update_kernel(
     out_ptr,
     state_batch_indices_ptr,
     dst_state_batch_indices_ptr,
-    pad_slot_id,
+    scales_ptr,
+    # shared_quant_ratio: tl.constexpr,
+    quant_group_size: tl.constexpr,
+    pad_slot_id: tl.constexpr,
     # Matrix dimensions
-    batch,
-    nheads,
-    dim,
-    dstate,
-    nheads_ngroups_ratio,
+    dim: tl.constexpr,
+    dstate: tl.constexpr,
+    nheads_ngroups_ratio: tl.constexpr,
     # Strides
-    stride_state_batch,
-    stride_state_head,
-    stride_state_dim,
-    stride_state_dstate,
-    stride_x_batch,
-    stride_x_head,
-    stride_x_dim,
-    stride_dt_batch,
-    stride_dt_head,
-    stride_dt_dim,
-    stride_dt_bias_head,
-    stride_dt_bias_dim,
-    stride_A_head,
-    stride_A_dim,
-    stride_A_dstate,
-    stride_B_batch,
-    stride_B_group,
-    stride_B_dstate,
-    stride_C_batch,
-    stride_C_group,
-    stride_C_dstate,
-    stride_D_head,
-    stride_D_dim,
-    stride_z_batch,
-    stride_z_head,
-    stride_z_dim,
-    stride_out_batch,
-    stride_out_head,
-    stride_out_dim,
+    stride_state_batch: tl.int64,
+    stride_state_head: tl.int64,
+    stride_state_dim: tl.int64,
+    stride_state_dstate: tl.constexpr,
+    stride_x_batch: tl.int64,
+    stride_x_head: tl.int64,
+    stride_x_dim: tl.constexpr,
+    stride_dt_batch: tl.int64,
+    stride_dt_head: tl.int64,
+    stride_dt_dim: tl.constexpr,
+    stride_dt_bias_head: tl.int64,
+    stride_dt_bias_dim: tl.constexpr,
+    stride_A_head: tl.int64,
+    stride_A_dim: tl.constexpr,
+    stride_A_dstate: tl.constexpr,
+    stride_B_batch: tl.int64,
+    stride_B_group: tl.int64,
+    stride_B_dstate: tl.constexpr,
+    stride_C_batch: tl.int64,
+    stride_C_group: tl.int64,
+    stride_C_dstate: tl.constexpr,
+    stride_D_head: tl.int64,
+    stride_D_dim: tl.constexpr,
+    stride_z_batch: tl.int64,
+    stride_z_head: tl.int64,
+    stride_z_dim: tl.constexpr,
+    stride_out_batch: tl.int64,
+    stride_out_head: tl.int64,
+    stride_out_dim: tl.constexpr,
+    stride_scales_batch: tl.int64,
+    stride_scales_head: tl.int64,
+    stride_scales_dim: tl.int64,
+    stride_scales_group: tl.constexpr,
     # Meta-parameters
+    IS_STATIC_SCALE: tl.constexpr,  # scaling factors are read-only
     DT_SOFTPLUS: tl.constexpr,
     TIE_HDIM: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -163,6 +176,34 @@ def _selective_scan_update_kernel(
         mask &= state_batch_idx != pad_slot_id
     state = tl.load(state_ptrs, mask=mask, other=0.0)
 
+    # Dequantization if state is fp8
+
+    if tl.constexpr(state_ptr.dtype.element_ty == tl.float8e4nv):
+        if quant_group_size == -1:  # per-token or per-head
+            fp8_scale = tl.load(
+                scales_ptr + pid_b * stride_scales_batch + pid_h * stride_scales_head
+            )
+            state = dequant_symmetric_per_tensor(state, fp8_scale)
+        else:
+            # BLOCK_SIZE_DSTATE can be a power of 2 value >= dstate
+            tl.static_assert(BLOCK_SIZE_DSTATE % quant_group_size == 0)
+            # ngroups_per_row = tl.cdiv(BLOCK_SIZE_DSTATE, quant_group_size)
+            offs_ngroups = tl.arange(0, (BLOCK_SIZE_DSTATE // quant_group_size))
+            # fp8_scale: [BLOCK_SIZE_M, ngroups_per_row]
+            fp8_scale = tl.load(
+                scales_ptr
+                + pid_b * stride_scales_batch
+                + pid_h * stride_scales_head
+                + offs_m[:, None] * stride_scales_dim
+                + offs_ngroups[None, :] * stride_scales_group,
+                mask=(
+                    (offs_m[:, None] < dim)
+                    & (offs_ngroups[None, :] < (dstate // quant_group_size))
+                ),
+                other=0.0,
+            )
+            state = dequant_symmetric_per_group(state, fp8_scale, quant_group_size)
+
     x = tl.load(x_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
     if not TIE_HDIM:
         dt = tl.load(dt_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
@@ -196,13 +237,41 @@ def _selective_scan_update_kernel(
     mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
     if HAS_STATE_BATCH_INDICES:
         mask &= state_batch_idx != pad_slot_id
-    tl.store(dst_state_ptrs, state, mask=mask)
+
     out = tl.sum(state * C[None, :], axis=1)
     if HAS_D:
         out += x * D
     if HAS_Z:
         out *= z * tl.sigmoid(z)
+
     tl.store(out_ptrs, out, mask=offs_m < dim)
+
+    # Quantization before store back
+    if tl.constexpr(state_ptr.dtype.element_ty == tl.float8e4nv):
+        if IS_STATIC_SCALE:
+            if quant_group_size == -1:
+                state, _ = quant_symmetric_per_tensor_fp8e4nv(state, fp8_scale)
+            else:
+                state, _ = quant_symmetric_per_group_fp8e4nv(
+                    state, quant_group_size, fp8_scale
+                )
+        else:  # dynamic
+            tl.static_assert(quant_group_size != -1)
+            state, scale = quant_symmetric_per_group_fp8e4nv(state, quant_group_size)
+            tl.store(
+                scales_ptr
+                + pid_b * stride_scales_batch
+                + pid_h * stride_scales_head
+                + offs_m[:, None] * stride_scales_dim
+                + offs_ngroups[None, :] * stride_scales_group,
+                scale,
+                mask=(
+                    (offs_m[:, None] < dim)
+                    & (offs_ngroups[None, :] < (dstate // quant_group_size))
+                ),
+            )
+
+    tl.store(dst_state_ptrs, state, mask=mask)
 
 
 def selective_state_update(
@@ -220,6 +289,8 @@ def selective_state_update(
     dst_state_batch_indices=None,
     pad_slot_id=PAD_SLOT_ID,
     out=None,
+    is_fp8_static_scale=None,
+    fp8_scales=None,
 ):
     """
     Argument:
@@ -238,9 +309,17 @@ def selective_state_update(
             for example: cache_indices = [pad_slot_id, 1, 20, pad_slot_id]
             in this case, the kernel will not process entries at
             indices 0 and 3
+        is_fp8_static_scale: determine whether fp8 scales are static
+        fp8_scales: fp8 scaling factors. In-place updated if dynamic.
+                    For dynamic quantization, we assume that the
+                    quantization granularity matches the parallelization
+                    granularity exactly. Runtime error is produced if it
+                    doesn't hold
         out: Preallocated ssm output tensor. Assume same shape as x.
              In-place updated.
     """
+    NO_HEADS = x.dim() == 2
+
     if state.dim() == 3:
         state = state.unsqueeze(1)
     if x.dim() == 2:
@@ -289,17 +368,60 @@ def selective_state_update(
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
     z_strides = (z.stride(0), z.stride(1), z.stride(2)) if z is not None else (0, 0, 0)
+    dt_bias_strides = (
+        (dt_bias.stride(0), dt_bias.stride(1)) if dt_bias is not None else (0, 0)
+    )
+    D_strides = (D.stride(0), D.stride(1)) if D is not None else (0, 0)
+
     # We don't want autotune since it will overwrite the state
     # We instead tune by hand.
-    BLOCK_SIZE_M, num_warps = (
-        (32, 4)
-        if dstate <= 16
-        else (
-            (16, 4)
-            if dstate <= 32
-            else ((8, 4) if dstate <= 64 else ((4, 4) if dstate <= 128 else ((4, 8))))
-        )
+    # BLOCK_SIZE_M, num_warps = ((32, 4) if dstate <= 16 else
+    #                            ((16, 4) if dstate <= 32 else
+    #                             ((8, 4) if dstate <= 64 else
+    #                              ((4, 4) if dstate <= 128 else ((4, 8))))))
+    BLOCK_SIZE_M, num_warps, num_stages = (
+        ((16, 2, 2) if batch > 64 else (16, 4, 2))
+        if state.dtype != torch.float8_e4m3fn
+        else ((16, 2, 2) if batch > 64 else (32, 2, 1))
     )
+
+    # FP8 quantization metadata
+    scales_strides = [0 for _ in range(state.ndim)]
+    quant_group_size = -1
+    if state.dtype == torch.float8_e4m3fn:
+        assert is_fp8_static_scale is not None
+        assert (fp8_scales is not None) and (fp8_scales.ndim > 0)
+
+        if NO_HEADS:
+            fp8_scales.unsqueeze_(1)
+
+        for i in range(fp8_scales.ndim):
+            scales_strides[i] = fp8_scales.stride(i)
+
+        if fp8_scales.ndim == state.ndim:  # per group
+            assert fp8_scales.ndim == 4
+            assert (fp8_scales.shape[0], fp8_scales.shape[1], fp8_scales.shape[2]) == (
+                batch,
+                nheads,
+                dim,
+            )
+            quant_ngroups = fp8_scales.shape[-1]
+            quant_group_size = dstate // quant_ngroups
+            # Simplifying assumption for quant_group_size
+            assert quant_group_size <= dstate
+            assert dstate % quant_group_size == 0
+        else:
+            assert fp8_scales.ndim == 1 or fp8_scales.ndim == 2
+            # No support for dynamic quantization across thread blocks
+            assert is_fp8_static_scale, (
+                "must be static scale for per-tensor or per-head quantization"
+            )
+
+            if fp8_scales.ndim == 1:  # per batch
+                assert fp8_scales.shape == (batch,)
+            elif fp8_scales.ndim == 2:  # per head
+                assert fp8_scales.shape == (batch, nheads)
+
     tie_hdim = (
         A.stride(-1) == 0
         and A.stride(-2) == 0
@@ -308,55 +430,64 @@ def selective_state_update(
     )
     with torch.cuda.device(x.device.index):
         _selective_scan_update_kernel[grid](
-            state,
-            x,
-            dt,
-            dt_bias,
-            A,
-            B,
-            C,
-            D,
-            z,
-            out,
-            state_batch_indices,
-            dst_state_batch_indices,
-            pad_slot_id,
-            batch,
-            nheads,
-            dim,
-            dstate,
-            nheads // ngroups,
-            state.stride(0),
-            state.stride(1),
-            state.stride(2),
-            state.stride(3),
-            x.stride(0),
-            x.stride(1),
-            x.stride(2),
-            dt.stride(0),
-            dt.stride(1),
-            dt.stride(2),
-            *(dt_bias.stride(0), dt_bias.stride(1)) if dt_bias is not None else 0,
-            A.stride(0),
-            A.stride(1),
-            A.stride(2),
-            B.stride(0),
-            B.stride(1),
-            B.stride(2),
-            C.stride(0),
-            C.stride(1),
-            C.stride(2),
-            *(D.stride(0), D.stride(1)) if D is not None else 0,
-            z_strides[0],
-            z_strides[1],
-            z_strides[2],
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            dt_softplus,
-            tie_hdim,
-            BLOCK_SIZE_M,
+            state_ptr=state,
+            x_ptr=x,
+            dt_ptr=dt,
+            dt_bias_ptr=dt_bias,
+            A_ptr=A,
+            B_ptr=B,
+            C_ptr=C,
+            D_ptr=D,
+            z_ptr=z,
+            out_ptr=out,
+            state_batch_indices_ptr=state_batch_indices,
+            dst_state_batch_indices_ptr=dst_state_batch_indices,
+            pad_slot_id=pad_slot_id,
+            dim=dim,
+            dstate=dstate,
+            nheads_ngroups_ratio=nheads // ngroups,
+            scales_ptr=fp8_scales,
+            # shared_quant_ratio=shared_quant_ratio,
+            quant_group_size=quant_group_size,
+            stride_state_batch=state.stride(0),
+            stride_state_head=state.stride(1),
+            stride_state_dim=state.stride(2),
+            stride_state_dstate=state.stride(3),
+            stride_x_batch=x.stride(0),
+            stride_x_head=x.stride(1),
+            stride_x_dim=x.stride(2),
+            stride_dt_batch=dt.stride(0),
+            stride_dt_head=dt.stride(1),
+            stride_dt_dim=dt.stride(2),
+            stride_dt_bias_head=dt_bias_strides[0],
+            stride_dt_bias_dim=dt_bias_strides[1],
+            stride_A_head=A.stride(0),
+            stride_A_dim=A.stride(1),
+            stride_A_dstate=A.stride(2),
+            stride_B_batch=B.stride(0),
+            stride_B_group=B.stride(1),
+            stride_B_dstate=B.stride(2),
+            stride_C_batch=C.stride(0),
+            stride_C_group=C.stride(1),
+            stride_C_dstate=C.stride(2),
+            stride_D_head=D_strides[0],
+            stride_D_dim=D_strides[1],
+            stride_z_batch=z_strides[0],
+            stride_z_head=z_strides[1],
+            stride_z_dim=z_strides[2],
+            stride_out_batch=out.stride(0),
+            stride_out_head=out.stride(1),
+            stride_out_dim=out.stride(2),
+            stride_scales_batch=scales_strides[0],
+            stride_scales_head=scales_strides[1],
+            stride_scales_dim=scales_strides[2],
+            stride_scales_group=scales_strides[3],
+            IS_STATIC_SCALE=is_fp8_static_scale,
+            DT_SOFTPLUS=dt_softplus,
+            TIE_HDIM=tie_hdim,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
             num_warps=num_warps,
+            num_stages=num_stages,
         )
 
 
