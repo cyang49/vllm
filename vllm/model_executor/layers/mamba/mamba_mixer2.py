@@ -487,12 +487,17 @@ class MambaMixer2(MambaBase, CustomOp):
         compilation_config.static_forward_context[prefix] = self
         # The tuple is (conv_state, ssm_state)
         self.kv_cache = (torch.tensor([]), torch.tensor([]))
-        self.ssm_state_quant = "static"
-        self.ssm_state_scale = nn.Parameter(torch.ones(()))
-        set_weight_attrs(self.ssm_state_scale, {"weight_loader": default_weight_loader})
         self.fp8_dtype = current_platform.fp8_dtype()
         self.model_config = model_config
         self.cache_config = cache_config
+        if cache_config is not None and cache_config.mamba_ssm_cache_dtype.startswith(
+            "fp8"
+        ):
+            self.ssm_state_quant = "static"
+            self.ssm_state_scale = nn.Parameter(torch.ones(()))
+            set_weight_attrs(
+                self.ssm_state_scale, {"weight_loader": default_weight_loader}
+            )
         self.prefix = prefix
 
         # Pre-compute sizes for forward pass
