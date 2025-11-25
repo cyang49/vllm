@@ -40,14 +40,13 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
     LoaderFunction,
     composed_weight_loader,
+    default_weight_loader,
     sharded_weight_loader,
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
-
-from .ssm_state_dicts import ssm_state_scale_dict_offline as ssm_state_scale_dict
 
 # Added by the IBM Team, 2024
 
@@ -489,15 +488,17 @@ class MambaMixer2(MambaBase, CustomOp):
         # The tuple is (conv_state, ssm_state)
         self.kv_cache = (torch.tensor([]), torch.tensor([]))
         self.ssm_state_quant = "static"
+        self.ssm_state_scale = nn.Parameter(torch.ones(()))
+        set_weight_attrs(self.ssm_state_scale, {"weight_loader": default_weight_loader})
         # self.ssm_state_quant = "dynamic" # this is BUGGED
         # self.ssm_state_scale = torch.tensor(
         #     ssm_state_scale_dict_max[prefix], dtype=torch.float32)
         # self.ssm_state_scale = torch.tensor(
         #     ssm_state_scale_dict_99[prefix], dtype=torch.float32
         # )
-        self.ssm_state_scale = torch.tensor(
-            ssm_state_scale_dict[prefix], dtype=torch.float32
-        )
+        # self.ssm_state_scale = torch.tensor(
+        #     ssm_state_scale_dict[prefix], dtype=torch.float32
+        # )
         # self.ssm_state_scale = torch.tensor(0.5, dtype=torch.float32)
         self.fp8_dtype = current_platform.fp8_dtype()
         self.model_config = model_config
@@ -732,6 +733,7 @@ class MambaMixer2(MambaBase, CustomOp):
                 )
 
                 # Dequantization
+                print(f"{self.ssm_state_scale=}")
                 if initial_states.dtype == self.fp8_dtype:
                     # per-tensor dequantization
                     initial_states = (
@@ -861,7 +863,7 @@ class MambaMixer2(MambaBase, CustomOp):
                         # per-tensor quantization
                         varlen_states, _ = scaled_fp8_quant(
                             varlen_states.view(num_prefills, -1).contiguous(),
-                            self.ssm_state_scale,
+                            self.ssm_state_scale.to(torch.float32),
                         )
                         # per-head quantization
                         # use torch as scaled_fp8_quant doesn't work for group-based
