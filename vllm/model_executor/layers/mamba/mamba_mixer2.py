@@ -5,6 +5,7 @@
 import torch
 from torch import nn
 
+from vllm._custom_ops import scaled_fp8_quant
 from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -39,9 +40,11 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
     LoaderFunction,
     composed_weight_loader,
+    default_weight_loader,
     sharded_weight_loader,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 
@@ -211,6 +214,14 @@ def mamba_v2_sharded_weight_loader(
             loaded_boundary += full_dim - extra
 
     return loader
+
+
+# Hard coded granite-4-small ssm state scale dict for experiments
+torch.set_printoptions(
+    sci_mode=True,
+    precision=6,
+    threshold=100000,
+)  # FOR DEBUG
 
 
 # Adapted from transformers.models.mamba.modeling_mamba.MambaMixer
@@ -476,9 +487,17 @@ class MambaMixer2(MambaBase, CustomOp):
         compilation_config.static_forward_context[prefix] = self
         # The tuple is (conv_state, ssm_state)
         self.kv_cache = (torch.tensor([]), torch.tensor([]))
-
+        self.fp8_dtype = current_platform.fp8_dtype()
         self.model_config = model_config
         self.cache_config = cache_config
+        if cache_config is not None and cache_config.mamba_ssm_cache_dtype.startswith(
+            "fp8"
+        ):
+            self.ssm_state_quant = "static"
+            self.ssm_state_scale = nn.Parameter(torch.ones(()))
+            set_weight_attrs(
+                self.ssm_state_scale, {"weight_loader": default_weight_loader}
+            )
         self.prefix = prefix
 
         # Pre-compute sizes for forward pass
@@ -572,7 +591,10 @@ class MambaMixer2(MambaBase, CustomOp):
             self_kv_cache = self.kv_cache[forward_context.virtual_engine]
             # conv_state = (..., dim, width-1) yet contiguous along 'dim'
             conv_state = self_kv_cache[0].transpose(-1, -2)
-            ssm_state = self_kv_cache[1]
+            if self.cache_config.mamba_ssm_cache_dtype.startswith("fp8"):
+                ssm_state = self_kv_cache[1].view(self.fp8_dtype)
+            else:
+                ssm_state = self_kv_cache[1]
             state_indices_tensor = attn_metadata.state_indices_tensor
             has_initial_states_p = attn_metadata.has_initial_states_p
             prep_initial_states = attn_metadata.prep_initial_states
@@ -705,6 +727,30 @@ class MambaMixer2(MambaBase, CustomOp):
                     0,
                 )
 
+                # Dequantization
+                # print(f"{self.ssm_state_scale=}")
+                if initial_states.dtype == self.fp8_dtype:
+                    # per-tensor dequantization
+                    initial_states = (
+                        initial_states.to(torch.float32) * self.ssm_state_scale
+                    ).to(torch.bfloat16)
+                    # per-head dequantization
+                    # initial_states = (
+                    #     initial_states.to(torch.float32)
+                    #     * self.ssm_state_scale[None, :, None, None]
+                    # ).to(torch.bfloat16)
+                    # per-128 group dequantization
+                    # initial_states = (
+                    #     initial_states.to(torch.float32)
+                    #     * self.ssm_state_scale.reshape(
+                    #         1, self.num_heads, self.head_dim, 1
+                    #     )
+                    # ).to(torch.bfloat16)
+            if ssm_state.dtype == self.fp8_dtype:
+                state_dtype = torch.bfloat16
+            else:
+                state_dtype = ssm_state.dtype
+
             # NOTE: final output is an in-place update of out tensor
             varlen_states = mamba_chunk_scan_combined_varlen(
                 hidden_states_p.view(
@@ -727,7 +773,7 @@ class MambaMixer2(MambaBase, CustomOp):
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(num_prefill_tokens, -1, self.head_dim),
-                state_dtype=ssm_state.dtype,
+                state_dtype=state_dtype,
             )
 
             if prefix_caching_enabled:
@@ -802,9 +848,56 @@ class MambaMixer2(MambaBase, CustomOp):
                 ] = varlen_states[last_chunk_indices_p]
 
             else:
+                _, nheads, headdim, dstate = varlen_states.shape
+                # Quantization before storing back
+                if ssm_state.dtype == self.fp8_dtype:
+                    if (
+                        self.ssm_state_scale is not None
+                        and self.ssm_state_quant == "static"
+                    ):
+                        # per-tensor quantization
+                        varlen_states, _ = scaled_fp8_quant(
+                            varlen_states.view(num_prefills, -1).contiguous(),
+                            self.ssm_state_scale.to(torch.float32),
+                        )
+                        # per-head quantization
+                        # use torch as scaled_fp8_quant doesn't work for group-based
+                        # scales
+                        # varlen_states = (
+                        #     varlen_states / self.ssm_state_scale[None, :, None, None]
+                        # )
+                        # per-128 element
+                        # varlen_states = varlen_states / self.ssm_state_scale.reshape(
+                        #     1, self.num_heads, self.head_dim, 1
+                        # )
+                        # varlen_states = varlen_states.clamp(-448.0, 448.0).to(
+                        #     self.fp8_dtype
+                        # )
+                    else:
+                        varlen_states, self.ssm_state_scale = scaled_fp8_quant(
+                            varlen_states.view(num_prefills, -1)
+                        )
+                        # print(f"{self.ssm_state_scale=}")
+                    varlen_states = varlen_states.reshape(
+                        num_prefills, nheads, headdim, dstate
+                    )
+                    # print(f"{self.ssm_state_scale=}")
                 # update ssm states
                 # - varlen state is a (num_prefills, nheads, headdim, dstate)
                 #   tensor
+                # DEBUG dump scale values
+                # Per-tensor
+                # _, fp8_scale = scaled_fp8_quant(varlen_states.view(num_prefills, -1))
+                # Per-head
+                # _, fp8_scale = scaled_fp8_quant(
+                #     varlen_states.permute(1, 0, 2, 3).contiguous().view(nheads, -1),
+                #     use_per_token_if_dynamic=True)
+                # Per-group (group_size=dstate)
+                # _, fp8_scale = scaled_fp8_quant(
+                #     varlen_states.permute(1, 2, 0, 3)
+                #     .contiguous().view(nheads*headdim, -1),
+                #     use_per_token_if_dynamic=True)
+                # print(f"prefill {self.prefix} {fp8_scale.flatten()=}")
                 ssm_state[state_indices_tensor_p] = varlen_states
 
         # Process decode requests
@@ -859,25 +952,87 @@ class MambaMixer2(MambaBase, CustomOp):
                 -1, self.num_heads // self.tp_size, self.head_dim
             )
 
-            # - the hidden is reshaped into (bs, num_heads, head_dim)
-            # - mamba_cache_params.ssm_state's slots will be selected
-            #   using state_indices_tensor_d
-            # NOTE: final output is an in-place update of out tensor
-            selective_state_update(
-                ssm_state,
-                hidden_states_d,
-                dt_d,
-                A_d,
-                B_d,
-                C_d,
-                D_d,
-                z=None,
-                dt_bias=dt_bias,
-                dt_softplus=True,
-                state_batch_indices=state_indices_tensor_d_input,
-                dst_state_batch_indices=state_indices_tensor_d_output,
-                out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
-            )
+            FP8_NON_FUSED_DECODE = False
+            if FP8_NON_FUSED_DECODE:
+                # Load from cache and dequant
+                ssm_states_d = ssm_state[state_indices_tensor_d_input]
+                # per-tensor dequantization
+                # ssm_states_d = (
+                #     ssm_states_d.to(torch.float32) * self.ssm_state_scale
+                # ).to(torch.bfloat16)
+                # per-head dequantization
+                # ssm_states_d = (
+                #     ssm_states_d.to(torch.float32)
+                #     * self.ssm_state_scale[None, :, None, None]
+                # ).to(torch.bfloat16)
+                ssm_states_d = (
+                    ssm_states_d.to(torch.float32) * self.ssm_state_scale
+                    # * self.ssm_state_scale.reshape(
+                    #     1, self.num_heads, self.head_dim, 1)
+                ).to(torch.bfloat16)
+
+                selective_state_update(
+                    ssm_states_d,
+                    hidden_states_d,
+                    dt_d,
+                    A_d,
+                    B_d,
+                    C_d,
+                    D_d,
+                    z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=True,
+                    out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
+                )
+
+                # Quantization before storing back
+                # original_shape = ssm_states_d.shape
+                # DON'T UPDATE SCALE in decode
+                # per-tensor quantization
+                # ssm_states_d, _ = scaled_fp8_quant(
+                #     ssm_states_d.view(num_decodes, -1), self.ssm_state_scale
+                # )
+                # ssm_state[state_indices_tensor_d_output] = \
+                #     ssm_states_d.reshape(
+                #         original_shape
+                #     )
+                # ssm_states_d = (ssm_states_d
+                #     / self.ssm_state_scale[None, :, None, None])
+                ssm_states_d = ssm_states_d / self.ssm_state_scale
+                # ssm_states_d = ssm_states_d / self.ssm_state_scale.reshape(
+                #     1, self.num_heads, self.head_dim, 1
+                # )
+                ssm_states_d = ssm_states_d.clamp(-448.0, 448.0).to(self.fp8_dtype)
+                ssm_state[state_indices_tensor_d_output] = ssm_states_d
+            else:
+                # - the hidden is reshaped into (bs, num_heads, head_dim)
+                # - mamba_cache_params.ssm_state's slots will be selected
+                #   using state_indices_tensor_d
+                # NOTE: final output is an in-place update of out tensor
+                selective_state_update(
+                    ssm_state,
+                    hidden_states_d,
+                    dt_d,
+                    A_d,
+                    B_d,
+                    C_d,
+                    D_d,
+                    z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=state_indices_tensor_d_input,
+                    dst_state_batch_indices=state_indices_tensor_d_output,
+                    out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
+                    is_fp8_static_scale=True,
+                    fp8_scales=(
+                        None
+                        if ssm_state.dtype != self.fp8_dtype
+                        else self.ssm_state_scale.expand(num_decodes)
+                    ),  # add batch dim
+                )
+            # _, fp8_scale = scaled_fp8_quant(
+            #    ssm_state[state_indices_tensor_d_output].view(num_decodes, -1))
+            # print(f"decode {self.prefix} {fp8_scale=}")
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         assert self.model_config is not None
