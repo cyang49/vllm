@@ -490,16 +490,6 @@ class MambaMixer2(MambaBase, CustomOp):
         self.ssm_state_quant = "static"
         self.ssm_state_scale = nn.Parameter(torch.ones(()))
         set_weight_attrs(self.ssm_state_scale, {"weight_loader": default_weight_loader})
-        # self.ssm_state_quant = "dynamic" # this is BUGGED
-        # self.ssm_state_scale = torch.tensor(
-        #     ssm_state_scale_dict_max[prefix], dtype=torch.float32)
-        # self.ssm_state_scale = torch.tensor(
-        #     ssm_state_scale_dict_99[prefix], dtype=torch.float32
-        # )
-        # self.ssm_state_scale = torch.tensor(
-        #     ssm_state_scale_dict[prefix], dtype=torch.float32
-        # )
-        # self.ssm_state_scale = torch.tensor(0.5, dtype=torch.float32)
         self.fp8_dtype = current_platform.fp8_dtype()
         self.model_config = model_config
         self.cache_config = cache_config
@@ -733,7 +723,7 @@ class MambaMixer2(MambaBase, CustomOp):
                 )
 
                 # Dequantization
-                print(f"{self.ssm_state_scale=}")
+                # print(f"{self.ssm_state_scale=}")
                 if initial_states.dtype == self.fp8_dtype:
                     # per-tensor dequantization
                     initial_states = (
